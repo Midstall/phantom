@@ -1,0 +1,21 @@
+.{
+    .name = .phantom,
+    .fingerprint = 0x6896f6ae4c03c51e,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lattice = .{
+            .url = "git+https://github.com/Midstall/lattice#9f01937729808b3cfae2b6fdf7f0f73d52fc7e53",
+            .hash = "lattice-0.1.0-TdtxHKxkCQCYZSbNBQXsEDs-hAm0pXxQMOZIlBu1f6AS",
+        },
+        .prism = .{
+            .url = "git+https://github.com/Midstall/prism#6b14a3e72bf05427e8ff75335f0206d079c508f0",
+            .hash = "prism-0.1.0-PSE12I20OAC4gr2XF_0RgEyXa0N0NvzYZyUsXI2VRkhR",
+        },
+        .webidl = .{
+            .url = "git+https://github.com/Midstall/webidl.zig#4b0d3c61d5f22e6072e9eacf03174e4e8393c6a2",
+            .hash = "webidl_zig-0.1.0-FrIyV_uUBgAGtNwP-OkLegPJMWUnpeKuPqDdVbWyC9Fn",
+        },
+    },
+    .paths = .{ "build", "build.zig", "build.zig.zon", "lib" },
+}

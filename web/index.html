@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Phantom web demo</title>
+  </head>
+  <body>
+    <script type="module">
+      // webidl-runtime is the JS host that backs the .client bindings. Build it from
+      // /home/ross/Midstall/webidl.zig/npm/webidl-runtime (npm -w @midstall/webidl-runtime run build)
+      // and serve its ESM output next to this file as ./webidl-runtime.js.
+      import { createHost } from "./webidl-runtime.js";
+
+      const host = createHost();
+      const { instance } = await WebAssembly.instantiateStreaming(
+        fetch("./phantom-hello-web.wasm"),
+        host.imports,
+      );
+      host.attach(instance);
+
+      // Hand the wasm handles for document, document.body, and window, init the
+      // persistent tree, and hold the returned app pointer for dispatching clicks.
+      const documentHandle = host.intern(document);
+      const bodyHandle = host.intern(document.body);
+      const windowHandle = host.intern(window);
+      const app = instance.exports.init(documentHandle, bodyHandle, windowHandle);
+      document.body.addEventListener("click", (e) => instance.exports.dispatchTap(app, e.clientX, e.clientY));
+      const onResize = () => instance.exports.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio);
+      window.addEventListener("resize", onResize);
+      matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener("change", onResize);
+    </script>
+  </body>
+</html>

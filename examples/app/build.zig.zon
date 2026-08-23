@@ -1,0 +1,10 @@
+.{
+    .name = .phantom_demo_app,
+    .fingerprint = 0xb15997b951037bb0,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .phantom = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
