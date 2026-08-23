@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const prism = @import("prism");
 const hal = prism.hal;
 const dl = @import("../display_list.zig");
@@ -696,6 +697,30 @@ pub const PrismBackend = struct {
         try ctx.submit(cb);
     }
 };
+
+/// Whether prism's compiled-in driver set BUILDS for this target. Not a claim
+/// about hardware, and not a claim about what any machine can draw.
+///
+/// The list is measured, not assumed, and it was measured twice.
+///
+/// `-Dtarget=aarch64-macos` builds clean with this forced open, prism and
+/// lattice both, so DARWIN IS FINE. That is what retired the `os.tag == .linux`
+/// this used to be: that form switched off a renderer which works on macOS, and
+/// it read as "is there a GPU" when prism ships a CPU rasterizer that wants no
+/// GPU anywhere.
+///
+/// `-Dtarget=x86_64-windows` fails with the default driver set inside prism's
+/// NVIDIA driver (`nvidia/transport/linux.zig`), which looked like the whole
+/// story: pick `software` alone and Windows would build. It does not. With
+/// `-Dgpu-drivers=software` the NVIDIA errors go away and the build then fails
+/// inside vulcan, at `vulcan-target/jit_platform.zig`, which has no Windows
+/// platform for prism's shader JIT to sit on. So no driver selection reaches a
+/// Windows build today and the exception is real rather than a configuration
+/// mistake. Not one of these errors is phantom's.
+///
+/// The way out is in code phantom does not own: a Windows platform in vulcan's
+/// JIT. That retires this constant, and nothing in phantom has to change for it.
+pub const builds_here = builtin.os.tag != .windows;
 
 /// Whether a device on this machine can actually draw, not merely start.
 ///

@@ -493,17 +493,26 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const gpu_drivers = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Prism's choice.");
+
     const phantom = b.addModule("phantom", .{
         .root_source_file = b.path("lib/phantom.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Slice 1B deps. Same target/optimize on both so Zig dedupes prism to a single
-    // module instance across lattice (which depends on prism internally) and phantom,
-    // otherwise lattice's RenderTarget prism types will not match PrismBackend's.
-    const lattice_dep = b.dependency("lattice", .{ .target = target, .optimize = optimize });
-    const prism_dep = b.dependency("prism", .{ .target = target, .optimize = optimize });
+    const lattice_dep = b.dependency("lattice", .{
+        .target = target,
+        .optimize = optimize,
+        .@"gpu-drivers" = gpu_drivers,
+    });
+
+    const prism_dep = b.dependency("prism", .{
+        .target = target,
+        .optimize = optimize,
+        .drivers = gpu_drivers,
+    });
+
     phantom.addImport("lattice", lattice_dep.module("lattice"));
     phantom.addImport("prism", prism_dep.module("prism"));
 

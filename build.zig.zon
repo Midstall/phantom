@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .lattice = .{
-            .url = "git+https://github.com/Midstall/lattice#9f01937729808b3cfae2b6fdf7f0f73d52fc7e53",
-            .hash = "lattice-0.1.0-TdtxHKxkCQCYZSbNBQXsEDs-hAm0pXxQMOZIlBu1f6AS",
+            .url = "git+https://github.com/Midstall/lattice#dc7ab4610a0b77167234af43e85b82ae99b63c15",
+            .hash = "lattice-0.1.0-TdtxHONlCQD42nhei2aw6kuqs7vRnA_mu4V_KvMDszjf",
         },
         .prism = .{
             .url = "git+https://github.com/Midstall/prism#6b14a3e72bf05427e8ff75335f0206d079c508f0",

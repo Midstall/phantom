@@ -12,28 +12,27 @@ const ansi = @import("tui/ansi.zig");
 const decode = @import("tui/decode.zig");
 const cell_grid = @import("backend/cell_grid.zig");
 const tui_cells = @import("backend/tui_cells.zig");
+const prism_backend = @import("backend/prism.zig");
 const tui_pixels = @import("backend/tui_pixels.zig");
 const kitty_gfx = @import("tui/kitty_gfx.zig");
 
 pub const Mode = enum { cells, pixels };
 
-/// Mode A renders through `tui_pixels.PixelSurface`, which brings up a real prism
-/// GPU device (`prism.drivers.createBestDevice`). That driver registry pulls in
-/// every compiled-in driver unconditionally, including Linux-only ones (raw
-/// `std.os.linux` ioctl/mmap calls) that do not cross-compile for Windows, and
-/// prism's own build does not yet exclude them there (see `app.zig`'s identical
-/// `gpu_available`, which this matches so the two stay in sync: Linux is the only
-/// target proven to cross-compile prism today).
-const gpu_available = builtin.os.tag == .linux;
+/// Whether mode A can be COMPILED here at all, which is prism's question and is
+/// answered in one place: see `backend.prism.builds_here`. Whether THIS machine
+/// can actually draw is a different question, asked at runtime of
+/// `backend.prism.canRasterize`, and prism answers yes with no GPU at all
+/// because it ships a CPU rasterizer.
+const rasterizer_builds = prism_backend.builds_here;
 
 /// `PHANTOM_TUI` accepts `pixel`, `cells` or `auto`. Any other value is user input
 /// and is a runtime fault, so it falls back to the detected capability rather than
 /// failing the program. Mode A never compiles in on a target with no GPU path (see
-/// `gpu_available`), so this returns `.cells` unconditionally there, even against
+/// `rasterizer_builds`), so this returns `.cells` unconditionally there, even against
 /// an explicit override: honoring `pixel` would runtime-fault later, unwrapping a
 /// surface that was never built.
 pub fn selectMode(c: caps_mod.Caps, override: ?[]const u8) Mode {
-    if (!gpu_available) return .cells;
+    if (!rasterizer_builds) return .cells;
     if (override) |o| {
         if (std.mem.eql(u8, o, "pixel") or std.mem.eql(u8, o, "pixels")) return .pixels;
         if (std.mem.eql(u8, o, "cells") or std.mem.eql(u8, o, "cell")) return .cells;
@@ -542,6 +541,17 @@ pub const Session = struct {
         // one path: the hint is folded in the same way either way.
         self.caps = if (opts.query_capabilities) try self.probe(hint) else caps_mod.parseReplies("", hint);
         self.mode = selectMode(self.caps, environ.get("PHANTOM_TUI"));
+        // The terminal saying it can SHOW an image is only half the question.
+        // The other half is whether prism can draw one, which is not a question
+        // about hardware: prism ships a CPU rasterizer, so the answer is usually
+        // yes with no GPU at all. Asked of prism rather than assumed, because
+        // when the answer is no, mode A transmits a picture of the background
+        // colour and nothing else, and a blank screen is a worse outcome than
+        // the cells that would have worked. Only asked when the answer can
+        // change anything, since it costs a device bring-up.
+        if (rasterizer_builds) {
+            if (self.mode == .pixels and !prism_backend.canRasterize(gpa)) self.mode = .cells;
+        }
 
         errdefer self.leaveModes();
         if (opts.raw_mode) try self.enterModes();
@@ -611,12 +621,12 @@ pub const Session = struct {
         // `viewport` is already the terminal's true pixel size, and layout runs
         // at the dpr, so the display list is in those same physical pixels. The
         // surface matches it one to one and mode A is sharp on a HiDPI display
-        // with no special case. `gpu_available and` makes this comptime-dead on
+        // with no special case. `rasterizer_builds and` makes this comptime-dead on
         // a target with no GPU path: without it, Zig would still have to compile
         // `PixelSurface.init` (and the prism driver registry it reaches into)
         // even though `mode` can never actually be `.pixels` there, because
         // `mode` is a runtime value Sema cannot trace back through `selectMode`.
-        self.surface = if (gpu_available and self.mode == .pixels)
+        self.surface = if (rasterizer_builds and self.mode == .pixels)
             try tui_pixels.PixelSurface.init(
                 gpa,
                 @intFromFloat(self.viewport.width),
