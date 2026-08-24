@@ -48,6 +48,37 @@ pub fn available(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
     return false;
 }
 
+/// Fold a lattice key event into the shared phantom key event. lattice has
+/// already run the keymap: the keysym arrives as the X11 number input.Keysym
+/// carries, so the conversion is a bit cast and not a table. The enum is
+/// non-exhaustive, so any u32 lattice can send is a valid cast.
+///
+/// Analyzed only where the compositor path builds: `lattice` is `void`
+/// elsewhere, and every reference to this function sits behind that gate.
+fn keyEventFromLattice(k: lattice.event.KeyEvent) phantom.input.KeyEvent {
+    return .{
+        .keysym = @enumFromInt(k.keysym),
+        .text = k.text,
+        .mods = .{
+            .shift = k.mods.shift,
+            .ctrl = k.mods.ctrl,
+            .alt = k.mods.alt,
+            .super = k.mods.super,
+        },
+        .action = switch (k.state) {
+            .pressed => .press,
+            .released => .release,
+        },
+    };
+}
+
+/// Route one lattice key event into the focus manager. The window path has no
+/// hard quit key: closing a window is the compositor's `close_requested`, and
+/// an application's own shortcuts are what `KeyboardListener` is for.
+fn dispatchKey(focus_mgr: *phantom.FocusManager, k: lattice.event.KeyEvent) void {
+    _ = focus_mgr.dispatch(keyEventFromLattice(k));
+}
+
 /// Where a window session draws, and how much of the process it takes over.
 ///
 /// Every default matches what `App.run` did when it was the only way in: a
@@ -135,6 +166,11 @@ pub const Session = struct {
     canvas: phantom.Canvas,
 
     dispatcher: phantom.input.Dispatcher,
+    /// The focus manager owns keyboard traversal for the tree. It must outlive
+    /// the element tree: tearing the tree down walks every render object and
+    /// calls back into this to forget its focus handler, which is why `deinit`
+    /// takes the tree down first. Mirrors `tui.Session`.
+    focus_mgr: phantom.FocusManager,
     /// The last pointer position, in physical pixels. A button and a scroll
     /// report no position of their own, so both land wherever the last motion
     /// left the pointer.
@@ -211,6 +247,14 @@ pub const Session = struct {
         });
         const view = self.owner.activeView().?;
 
+        // The focus manager must exist before the tree does: a failed mount
+        // tears the partial tree down through `errdefer`, and that walk calls
+        // back into the manager to forget each focus handler. Mirrors
+        // `tui.Session.init`.
+        self.focus_mgr = .{};
+        errdefer self.focus_mgr.deinit(gpa);
+        self.owner.focus = &self.focus_mgr;
+
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = &self.owner };
         const root_widget = root.call(&bctx);
         var mq = phantom.MediaQuery{ .data = &view.metrics, .child = root_widget };
@@ -240,6 +284,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.canvas.deinit();
         self.el.deinit(self.gpa);
+        self.focus_mgr.deinit(self.gpa);
         self.owner.deinit();
         self.arena.deinit();
         self.ctx.destroySurface(self.surface.id);
@@ -269,6 +314,9 @@ pub const Session = struct {
         const ts = std.Io.Clock.now(.awake, self.io);
         self.owner.scheduler.tick(ts.nanoseconds);
         self.owner.flushDirty(&bctx);
+        // A rebuild can add or remove focusable nodes, so the traversal order is
+        // rebuilt from the tree rather than kept incrementally.
+        try self.focus_mgr.collect(self.gpa, self.el);
 
         const rt = try self.ctx.renderTarget(self.surface.id);
         const vp = phantom.PhysicalSize{
@@ -347,12 +395,79 @@ pub const Session = struct {
                     @as(f32, @floatCast(a.horizontal)) * self.scale,
                     @as(f32, @floatCast(a.vertical)) * self.scale,
                 ),
+                .key => |k| dispatchKey(&self.focus_mgr, k),
                 else => {},
             },
             else => {},
         }
     }
 };
+
+test "a lattice key event becomes a phantom key event" {
+    if (!compositor_builds) return;
+    const lk = lattice.event.KeyEvent{
+        .keycode = 30,
+        .state = .pressed,
+        .keysym = 'a',
+        .mods = .{ .shift = true },
+        .text = "A",
+    };
+    const ev = keyEventFromLattice(lk);
+    try std.testing.expectEqual(phantom.input.Keysym.fromCodepoint('a'), ev.keysym);
+    try std.testing.expectEqualStrings("A", ev.text.?);
+    try std.testing.expect(ev.mods.shift);
+    try std.testing.expect(!ev.mods.ctrl);
+    try std.testing.expectEqual(phantom.input.KeyAction.press, ev.action);
+}
+
+test "a released lattice key reports the release action and keeps its keysym" {
+    if (!compositor_builds) return;
+    const lk = lattice.event.KeyEvent{ .keycode = 30, .state = .released, .keysym = 'a' };
+    const ev = keyEventFromLattice(lk);
+    try std.testing.expectEqual(phantom.input.KeyAction.release, ev.action);
+    try std.testing.expectEqual(phantom.input.Keysym.fromCodepoint('a'), ev.keysym);
+    try std.testing.expect(ev.text == null);
+    try std.testing.expect(ev.mods.none());
+}
+
+test "a key event reaches the focused node's handler" {
+    if (!compositor_builds) return;
+    const Seen = struct {
+        var last: ?phantom.input.Keysym = null;
+        fn onKey(_: *anyopaque, ev: phantom.input.KeyEvent) bool {
+            last = ev.keysym;
+            return true;
+        }
+    };
+    Seen.last = null;
+
+    var dummy: u8 = 0;
+    var handlers = phantom.FocusHandlers{ .ctx = &dummy, .on_key = Seen.onKey };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(std.testing.allocator);
+    try mgr.order.append(std.testing.allocator, &handlers);
+    mgr.focusNext();
+
+    dispatchKey(&mgr, .{ .keycode = 30, .state = .pressed, .keysym = 'a' });
+    try std.testing.expectEqual(@as(?phantom.input.Keysym, phantom.input.Keysym.fromCodepoint('a')), Seen.last);
+}
+
+test "Tab moves the focus through the window path" {
+    if (!compositor_builds) return;
+    var dummy: u8 = 0;
+    var first = phantom.FocusHandlers{ .ctx = &dummy };
+    var second = phantom.FocusHandlers{ .ctx = &dummy };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(std.testing.allocator);
+    try mgr.order.append(std.testing.allocator, &first);
+    try mgr.order.append(std.testing.allocator, &second);
+    mgr.focusNext();
+
+    // 0xFF09 is the X11 Tab keysym, which is what lattice reports after its
+    // keymap resolves the key.
+    dispatchKey(&mgr, .{ .keycode = 15, .state = .pressed, .keysym = 0xFF09 });
+    try std.testing.expect(mgr.current == &second);
+}
 
 test "the default options open the window phantom has always opened" {
     const o = Options{};
