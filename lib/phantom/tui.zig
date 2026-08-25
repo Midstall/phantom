@@ -136,6 +136,31 @@ const FrameState = struct {
     forced: bool,
 };
 
+/// The logical text size that makes one line of the default body font occupy
+/// exactly one terminal cell, or null when the mode does not want one.
+///
+/// `.cells` returns null: there the mono metrics give every line the cell height
+/// and ignore the size outright, so setting one would be a number nothing reads.
+///
+/// `.pixels` is the case this exists for. It measures text with the font's own
+/// proportional metrics, so a line is as tall as the FONT says, and the theme's
+/// default of 24 logical pixels made each line about one and a half cells: an
+/// 80x24 terminal held about 13 rows instead of 24. Sizing the default from the
+/// cell instead makes a terminal's row count mean what it says, and it does so
+/// on every terminal rather than at one assumed cell size.
+///
+/// Logical, not physical, because `Text` scales by the layout scale (the dpr)
+/// before measuring. Divide the physical answer back out here and the two
+/// multiplications cancel at exactly one cell.
+fn cellTextSize(owner: *phantom.BuildOwner, m: Mode, cell_h: f32, dpr: f32) ?f32 {
+    if (m == .cells) return null;
+    if (dpr <= 0) return null;
+    const body = phantom.theme.defaultTheme(owner).body_font;
+    const physical = body.sizeForLineHeight(cell_h);
+    if (physical <= 0) return null;
+    return physical / dpr;
+}
+
 /// Whether the next frame must be a full-screen base rather than an overlay.
 ///
 /// Split out from `renderPixels` and made pure because it is a POLICY, and the
@@ -623,6 +648,13 @@ pub const Session = struct {
         // The mono metrics are in physical pixels, the same space the cell grid
         // uses.
         self.owner.text_metrics = textMetricsFor(self.mode, self.cell_w, self.cell_h);
+        // Sized from the terminal's own cell, so a row of text is a row of the
+        // terminal. See `cellTextSize`. Set on the owner's default theme, which
+        // is what a `Text` with no size of its own resolves to, so an
+        // application that does state a size still gets exactly that.
+        if (cellTextSize(&self.owner, self.mode, self.cell_h, self.dpr)) |ts| {
+            self.owner.default_theme.?.text_size = ts;
+        }
 
         // MediaQuery reports the LOGICAL size, so a widget that reads it sees
         // the same numbers on both machines: a fixed nominal cell height, not
@@ -781,6 +813,14 @@ pub const Session = struct {
         //    one. `mode` cannot change after startup, so this is not a fresh
         //    decision every resize: it is the startup choice honored again.
         self.owner.text_metrics = textMetricsFor(self.mode, self.cell_w, self.cell_h);
+        // Sized from the terminal's own cell, so a row of text is a row of the
+        // terminal. See `cellTextSize`. Set on the owner's default theme, which
+        // is what a `Text` with no size of its own resolves to, so an
+        // application that does state a size still gets exactly that.
+        if (cellTextSize(&self.owner, self.mode, self.cell_h, self.dpr)) |ts| {
+            self.owner.default_theme.?.text_size = ts;
+        }
+
         // 4. The physical viewport drives the layout constraints.
         self.viewport = new_size.viewport();
         // 4b. Mode A's offscreen surface has to move with everything above, or
@@ -2020,4 +2060,69 @@ test "the amortised cost never exceeds twice that of sending a full frame every 
         }
     }
     try std.testing.expect(sent < 2 * test_screen * frames);
+}
+
+test "cells mode wants no text size, because its metrics ignore one" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    try std.testing.expect(cellTextSize(&owner, .cells, 18, 1.0) == null);
+}
+
+test "pixels mode sizes text so one line is exactly one terminal cell" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+
+    // A terminal reporting no pixel size: dpr is 1, so logical and physical are
+    // the same and the answer can be checked against the font directly.
+    const cell_h: f32 = 18;
+    const size = cellTextSize(&owner, .pixels, cell_h, 1.0).?;
+    const body = phantom.theme.defaultTheme(&owner).body_font;
+    try std.testing.expectApproxEqRel(cell_h, body.lineHeight(size), 0.0001);
+}
+
+test "an 80x24 terminal holds 24 rows of default text, not 13" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+
+    // The reported geometry of a plain 80x24 terminal with an 8x18 cell.
+    const term_size = term_mod.Size{ .cols = 80, .rows = 24, .xpixel = 640, .ypixel = 432 };
+    const cell_h = term_size.cellHeight();
+    const dpr = term_size.dpr();
+    const viewport = term_size.viewport();
+
+    const logical_size = cellTextSize(&owner, .pixels, cell_h, dpr).?;
+    const body = phantom.theme.defaultTheme(&owner).body_font;
+    // What a `Text` actually measures with: the logical size times the scale.
+    const rows = viewport.height / body.lineHeight(logical_size * dpr);
+    try std.testing.expectApproxEqRel(@as(f32, 24), rows, 0.0001);
+
+    // And what the old fixed 24 logical pixels gave, which is the bug: a little
+    // over half the rows the terminal actually has.
+    const old_rows = viewport.height / body.lineHeight(24 * dpr);
+    try std.testing.expect(old_rows < 15);
+}
+
+test "the row count comes out the same on a HiDPI terminal showing the same grid" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    const body = phantom.theme.defaultTheme(&owner).body_font;
+
+    // Same 80x24 grid, one ordinary display and one HiDPI, which report very
+    // different cell pixels. Uniformity across terminals is the point: a layout
+    // that fits on one has to fit on the other.
+    const ordinary = term_mod.Size{ .cols = 80, .rows = 24, .xpixel = 640, .ypixel = 432 };
+    const hidpi = term_mod.Size{ .cols = 80, .rows = 24, .xpixel = 1520, .ypixel = 888 };
+    inline for (.{ ordinary, hidpi }) |s| {
+        const ts = cellTextSize(&owner, .pixels, s.cellHeight(), s.dpr()).?;
+        const rows = s.viewport().height / body.lineHeight(ts * s.dpr());
+        try std.testing.expectApproxEqRel(@as(f32, 24), rows, 0.0001);
+    }
 }

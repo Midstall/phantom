@@ -71,6 +71,7 @@ pub const KeyboardListener = struct {
         ro.handlers = .{
             .ctx = ro,
             .on_key = if (self.on_key != null) RenderKeyboardListener.keyThunk else null,
+            .node = &ro.base,
         };
         ro.base.key_listener = &ro.handlers;
     }

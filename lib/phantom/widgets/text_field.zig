@@ -289,6 +289,11 @@ pub const TextField = struct {
     /// valid for the call only.
     on_change: ?*const fn (ctx: *anyopaque, text: []const u8) void = null,
     ctx: *anyopaque = undefined,
+    /// The name `FocusManager.focusById` moves the focus here by. This is what a
+    /// click on the field routes through, because a pointer hit gives a render
+    /// object and the focus is held by name. Null leaves the field reachable
+    /// through Tab only.
+    id: ?[]const u8 = null,
 
     pub fn widget(self: *const TextField) Widget {
         return phantom.StatefulWidget(TextField, self);
@@ -314,6 +319,9 @@ pub const TextField = struct {
         color: ?geom.Color = null,
         caret_color: ?geom.Color = null,
         caret_width: f32 = 2,
+        /// Borrowed from the config. The `Focus` widget below copies it, so the
+        /// slice only has to survive until the next build.
+        id: ?[]const u8 = null,
         // The built configs live here so their addresses stay stable across the
         // build, which is what a Widget borrows.
         view: CaretText = undefined,
@@ -351,6 +359,7 @@ pub const TextField = struct {
             s.caret_color = config.caret_color;
             s.caret_width = config.caret_width;
             s.blink_period = config.blink_period;
+            s.id = config.id;
         }
 
         /// The text as it stands. Borrowed and valid until the next edit.
@@ -375,6 +384,7 @@ pub const TextField = struct {
                 .on_key = State.onKey,
                 .on_focus_change = State.onFocusChange,
                 .ctx = s,
+                .id = s.id,
             };
             return s.focus_config.widget();
         }
@@ -565,6 +575,35 @@ const Fixture = struct {
         _ = self.manager.dispatch(.{ .keysym = key });
     }
 };
+
+test "a named TextField takes the focus by id, which is what a click on it does" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .id = "prompt", .text = "" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.refresh();
+
+    // A pointer hit gives the application a place on screen, not a Tab count, so
+    // this is the only way a click can reach one field out of several.
+    try std.testing.expect(f.manager.focusById("prompt"));
+    f.typeText("hi");
+    const s = try f.state();
+    try std.testing.expectEqualStrings("hi", s.value());
+}
+
+test "an unnamed TextField answers to no id, so a stray name cannot focus it" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.refresh();
+
+    try std.testing.expect(!f.manager.focusById("prompt"));
+    f.typeText("hi");
+    const s = try f.state();
+    // Nothing holds the focus, so the key went nowhere.
+    try std.testing.expectEqualStrings("", s.value());
+}
 
 test "typing inserts at the caret and not at the end of the text" {
     const gpa = std.testing.allocator;
@@ -903,12 +942,15 @@ test "unmounting a focused field cancels its blink registration" {
     try std.testing.expectEqual(@as(usize, 0), owner.scheduler.entries.items.len);
 
     // Tear down the rest by hand: the harness root was already freed above.
+    // This mirrors `Harness.deinit` and has to be kept in step with it.
+    f.harness.focus.deinit(gpa);
     owner.deinit();
     f.harness.canvas.deinit();
     f.harness.arena.deinit();
     gpa.destroy(f.harness.arena);
     gpa.destroy(f.harness.owner);
     gpa.destroy(f.harness.sink);
+    gpa.destroy(f.harness.focus);
     f.manager.deinit(gpa);
 }
 

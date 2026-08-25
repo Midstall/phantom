@@ -5,6 +5,10 @@ pub const builtin = @import("text/builtin.zig");
 pub const Font = @import("text/Font.zig");
 pub const Glyph = @import("text/raster.zig").Coverage;
 pub const mono = @import("text/mono.zig");
+/// Line layout: `layoutLine` measures and positions one run. Exported because a
+/// caller that needs to break text itself, or to measure a run before drawing
+/// it, otherwise cannot reach the function phantom uses for its own text.
+pub const layout = @import("text/layout.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

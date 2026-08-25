@@ -18,12 +18,45 @@ pub const grid_units: u16 = 24;
 /// one mark under another one's name.
 pub const Id = enum(u32) {
     torii = 0,
+
+    // The interface set. Each is a centreline on the same 24 grid the torii
+    // uses, drawn inside a 2 unit margin so a mark never touches its own box,
+    // except the two rules, which are deliberately full bleed (see below).
+    //
+    // These exist because the bundled fonts do not have them. Mesmerize and
+    // Neuropol are display faces: every non-ASCII codepoint probed, U+2713 and
+    // U+2502 among them, resolves to glyph 0. In cell mode that costs nothing,
+    // since the terminal draws text with its own font, but pixel mode
+    // rasterises with the bundled faces and a tick came out as a replacement
+    // box. A mark phantom draws itself works in both.
+    check = 1,
+    cross = 2,
+    chevron_left = 3,
+    chevron_right = 4,
+    chevron_up = 5,
+    chevron_down = 6,
+    arrow_right = 7,
+    plus = 8,
+    minus = 9,
+    rule_vertical = 10,
+    rule_horizontal = 11,
 };
 
 /// The centreline of `id`.
 pub fn pathFor(id: Id) path.Path {
     return switch (id) {
         .torii => torii,
+        .check => check,
+        .cross => cross,
+        .chevron_left => chevron_left,
+        .chevron_right => chevron_right,
+        .chevron_up => chevron_up,
+        .chevron_down => chevron_down,
+        .arrow_right => arrow_right,
+        .plus => plus,
+        .minus => minus,
+        .rule_vertical => rule_vertical,
+        .rule_horizontal => rule_horizontal,
     };
 }
 
@@ -224,4 +257,207 @@ test "the torii rasterises with solid pillars and a clear gap between them" {
     // grid and never clip the mark.
     try std.testing.expect(cov.left >= 0 and right <= 24);
     try std.testing.expect(bottom >= 0 and top <= 24);
+}
+
+// ---------------------------------------------------------------------------
+// The interface set
+//
+// Authored directly on the 24 grid rather than transcribed from a generator, so
+// the numbers below ARE the geometry. Two rules hold across all of them:
+//
+//   * y grows UPWARDS here, as it does for the torii above, because
+//     `text/raster.zig` flips on its way to a top-down bitmap.
+//   * a mark keeps a 2 unit margin, so the default 1.7 stroke has room for its
+//     round cap without touching the edge of the box.
+//
+// The exception is the two rules, which run the full height or width. A rail is
+// drawn once per row and has to JOIN the one above it: a 2 unit margin would
+// leave a visible gap at every row boundary, so they run 0 to 24 and take butt
+// caps, which stop exactly at the boundary instead of rounding past it.
+
+/// A tick. Down from the left, then up to the right, with the vertex low and
+/// off centre, which is what makes it read as a tick rather than a V.
+const check = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 13 } },
+    .{ .line = .{ .x = 10, .y = 8 } },
+    .{ .line = .{ .x = 19, .y = 18 } },
+} };
+
+/// Two diagonals through the centre.
+const cross = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 6.5, .y = 6.5 } },
+    .{ .line = .{ .x = 17.5, .y = 17.5 } },
+    .{ .move = .{ .x = 17.5, .y = 6.5 } },
+    .{ .line = .{ .x = 6.5, .y = 17.5 } },
+} };
+
+const chevron_left = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 14.5, .y = 19 } },
+    .{ .line = .{ .x = 8, .y = 12 } },
+    .{ .line = .{ .x = 14.5, .y = 5 } },
+} };
+
+const chevron_right = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 9.5, .y = 19 } },
+    .{ .line = .{ .x = 16, .y = 12 } },
+    .{ .line = .{ .x = 9.5, .y = 5 } },
+} };
+
+const chevron_up = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 9.5 } },
+    .{ .line = .{ .x = 12, .y = 16 } },
+    .{ .line = .{ .x = 19, .y = 9.5 } },
+} };
+
+const chevron_down = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 14.5 } },
+    .{ .line = .{ .x = 12, .y = 8 } },
+    .{ .line = .{ .x = 19, .y = 14.5 } },
+} };
+
+/// Shaft and head. The head meets the shaft at its tip rather than crossing it,
+/// so the join stays clean at a small size.
+const arrow_right = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 4, .y = 12 } },
+    .{ .line = .{ .x = 19.5, .y = 12 } },
+    .{ .move = .{ .x = 13.5, .y = 18 } },
+    .{ .line = .{ .x = 19.5, .y = 12 } },
+    .{ .line = .{ .x = 13.5, .y = 6 } },
+} };
+
+const plus = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 12, .y = 5 } },
+    .{ .line = .{ .x = 12, .y = 19 } },
+    .{ .move = .{ .x = 5, .y = 12 } },
+    .{ .line = .{ .x = 19, .y = 12 } },
+} };
+
+const minus = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 12 } },
+    .{ .line = .{ .x = 19, .y = 12 } },
+} };
+
+/// Full bleed and butt capped, so stacking one per row draws a continuous rail
+/// with no seam at the row boundaries. This is U+2502's job in a terminal, and
+/// the reason it is here is that no bundled font has that glyph.
+const rule_vertical = path.Path{
+    .verbs = &.{
+        .{ .move = .{ .x = 12, .y = 0 } },
+        .{ .line = .{ .x = 12, .y = 24 } },
+    },
+    .stroke = .{ .cap = .butt },
+};
+
+/// The same, along the other axis, for a separator that meets its neighbours.
+const rule_horizontal = path.Path{
+    .verbs = &.{
+        .{ .move = .{ .x = 0, .y = 12 } },
+        .{ .line = .{ .x = 24, .y = 12 } },
+    },
+    .stroke = .{ .cap = .butt },
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// The margin every mark keeps, except the two rules. See the section comment.
+const margin: f32 = 2;
+
+const Bounds = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+
+fn boundsOf(p: path.Path) Bounds {
+    var b = Bounds{ .min_x = grid, .min_y = grid, .max_x = 0, .max_y = 0 };
+    for (p.verbs) |v| {
+        const pts: []const path.Point = switch (v) {
+            .move => |pt| &.{pt},
+            .line => |pt| &.{pt},
+            .quad => |q| &.{ q.ctrl, q.end },
+            .cubic => |c| &.{ c.c1, c.c2, c.end },
+            .close => &.{},
+        };
+        for (pts) |pt| {
+            b.min_x = @min(b.min_x, pt.x);
+            b.min_y = @min(b.min_y, pt.y);
+            b.max_x = @max(b.max_x, pt.x);
+            b.max_y = @max(b.max_y, pt.y);
+        }
+    }
+    return b;
+}
+
+test "every built-in id has a path, and none of them is empty" {
+    // Exhaustive over the enum, so adding a member without a centreline fails
+    // here rather than drawing nothing at a call site.
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const id: Id = @enumFromInt(f.value);
+        try std.testing.expect(pathFor(id).verbs.len > 0);
+    }
+}
+
+test "every built-in mark stays inside its own grid" {
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const b = boundsOf(pathFor(@enumFromInt(f.value)));
+        try std.testing.expect(b.min_x >= 0 and b.min_y >= 0);
+        try std.testing.expect(b.max_x <= grid and b.max_y <= grid);
+    }
+}
+
+test "the interface marks keep their margin, so a round cap never touches the edge" {
+    // The rules are excluded on purpose: they are full bleed so that stacking
+    // them draws a continuous rail, which is the whole reason they exist.
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const id: Id = @enumFromInt(f.value);
+        if (id == .rule_vertical or id == .rule_horizontal or id == .torii) continue;
+        const b = boundsOf(pathFor(id));
+        try std.testing.expect(b.min_x >= margin and b.min_y >= margin);
+        try std.testing.expect(b.max_x <= grid - margin and b.max_y <= grid - margin);
+    }
+}
+
+test "a rule runs the full length and stops square, so stacked rules meet with no seam" {
+    const v = pathFor(.rule_vertical);
+    const vb = boundsOf(v);
+    try std.testing.expectEqual(@as(f32, 0), vb.min_y);
+    try std.testing.expectEqual(grid, vb.max_y);
+    // A round cap would bulge past the boundary and a gap would still show
+    // between rows wherever the bulge did not reach.
+    try std.testing.expectEqual(path.Cap.butt, v.stroke.cap);
+
+    const h = pathFor(.rule_horizontal);
+    const hb = boundsOf(h);
+    try std.testing.expectEqual(@as(f32, 0), hb.min_x);
+    try std.testing.expectEqual(grid, hb.max_x);
+    try std.testing.expectEqual(path.Cap.butt, h.stroke.cap);
+}
+
+test "every built-in mark rasterises to real ink, which is what a missing glyph did not" {
+    const gpa = std.testing.allocator;
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const id: Id = @enumFromInt(f.value);
+        var out = try stroke.expand(gpa, pathFor(id));
+        defer out.deinit(gpa);
+        // The same call the GPU backend makes in `ensureIcon`.
+        var cov = try raster.rasterize(gpa, out, grid_units, 24, grid_units);
+        defer cov.deinit(gpa);
+
+        var lit: usize = 0;
+        for (cov.pixels) |px| {
+            if (px > 0) lit += 1;
+        }
+        // The point of the whole set: a tick drawn by phantom puts ink on the
+        // surface, where U+2713 in a bundled font resolved to glyph 0.
+        try std.testing.expect(lit > 0);
+    }
+}
+
+test "the check mark is a tick and not a V: its vertex sits left of centre" {
+    const b = boundsOf(pathFor(.check));
+    const verbs = pathFor(.check).verbs;
+    try std.testing.expectEqual(@as(usize, 3), verbs.len);
+    const vertex = verbs[1].line;
+    // Lowest point of the three, and left of the middle, which is what
+    // distinguishes a tick from a symmetric V.
+    try std.testing.expectEqual(b.min_y, vertex.y);
+    try std.testing.expect(vertex.x < grid / 2);
 }

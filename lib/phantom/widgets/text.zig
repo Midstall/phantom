@@ -22,7 +22,14 @@ const RenderText = struct {
     size: f32,
     physical_size: f32 = 0,
     color: geom.Color,
-    line: ?text_layout.Line = null,
+    /// Break the text to the width the constraints allow. False keeps the old
+    /// single-line behaviour, where a long string simply runs past its box.
+    ///
+    /// Off by default on purpose: turning it on for everyone would silently
+    /// change the height of every existing `Text` that happens to sit in a
+    /// narrow box, and a layout that was correct would quietly grow a row.
+    wrap: bool = false,
+    para: ?text_layout.Paragraph = null,
     /// Points at `BuildOwner.text_metrics`, which outlives every element in the tree.
     /// A pointer and not a copy, so a resize that changes the cell size reaches the
     /// next layout with no remount.
@@ -30,37 +37,54 @@ const RenderText = struct {
 
     fn layoutFn(base: *RenderObject, c: layout_mod.BoxConstraints) geom.PhysicalSize {
         const self: *RenderText = @fieldParentPtr("base", base);
-        if (self.line) |*l| {
-            l.deinit(self.gpa);
-            self.line = null;
+        if (self.para) |*p| {
+            p.deinit(self.gpa);
+            self.para = null;
         }
         self.physical_size = self.size * c.scale;
-        const l = text_layout.layoutLine(self.gpa, self.font, self.text, self.physical_size, self.text_metrics.*) catch {
+        // A zero width tells `layoutParagraph` not to wrap, which is exactly
+        // what an unwrapped Text wants and what an unbounded constraint means.
+        const wrap_width: f32 = if (self.wrap) c.max_width else 0;
+        const p = text_layout.layoutParagraph(
+            self.gpa,
+            self.font,
+            self.text,
+            self.physical_size,
+            self.text_metrics.*,
+            wrap_width,
+        ) catch {
             return c.constrain(.{ .width = 0, .height = 0 });
         };
-        self.line = l;
-        return c.constrain(.{ .width = l.width, .height = l.height });
+        self.para = p;
+        return c.constrain(.{ .width = p.width, .height = p.height });
     }
 
     fn paintFn(base: *RenderObject, cv: *Canvas, offset: geom.PhysicalOffset) anyerror!void {
         const self: *RenderText = @fieldParentPtr("base", base);
-        const l = self.line orelse return;
-        cv.drawText(.{
-            .glyphs = l.glyphs,
-            .text = self.text,
-            .font = @ptrCast(self.font),
-            .size = self.physical_size,
-            .color = self.color,
-            .origin = offset,
-            .ascent = l.ascent,
-        }) catch |e| {
-            if (cv.sink) |s| s.report(.render_failed, @errorName(e));
-        };
+        const p = self.para orelse return;
+        // One run per line, stacked by the height of the lines above it. Each
+        // run carries its own ascent, so a backend that places a baseline does
+        // not have to know the paragraph exists.
+        var y = offset.y;
+        for (p.lines) |l| {
+            cv.drawText(.{
+                .glyphs = l.glyphs,
+                .text = self.text,
+                .font = @ptrCast(self.font),
+                .size = self.physical_size,
+                .color = self.color,
+                .origin = .{ .x = offset.x, .y = y },
+                .ascent = l.ascent,
+            }) catch |e| {
+                if (cv.sink) |s| s.report(.render_failed, @errorName(e));
+            };
+            y += l.height;
+        }
     }
 
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
         const self: *RenderText = @fieldParentPtr("base", base);
-        if (self.line) |*l| l.deinit(self.gpa);
+        if (self.para) |*p| p.deinit(self.gpa);
         // RenderText owns a copy of the string (the widget config it came from lives
         // in the per-frame build arena, which is reset after each frame).
         gpa.free(self.text);
@@ -73,6 +97,11 @@ pub const Text = struct {
     font: ?*Font = null,
     size: ?f32 = null,
     color: ?geom.Color = null,
+    /// Break the text to the width the box allows instead of running past it.
+    ///
+    /// Off by default, so an existing layout keeps the height it had. A caller
+    /// that wants a paragraph asks for one.
+    wrap: bool = false,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
 
@@ -115,6 +144,7 @@ pub const Text = struct {
             .text = text_copy,
             .size = r.size,
             .color = r.color,
+            .wrap = self.wrap,
             .text_metrics = &bctx.owner.text_metrics,
         };
         const el = try gpa.create(Element);
@@ -141,9 +171,12 @@ pub const Text = struct {
         ro.font = r.font;
         ro.size = r.size;
         ro.color = r.color;
-        if (ro.line) |*l| {
-            l.deinit(ro.gpa);
-            ro.line = null;
+        ro.wrap = self.wrap;
+        // Dropped rather than re-laid out here: the next layout rebuilds it,
+        // and it cannot be rebuilt now because the constraints are not known.
+        if (ro.para) |*p| {
+            p.deinit(ro.gpa);
+            ro.para = null;
         }
     }
 };
@@ -225,11 +258,11 @@ test "Text.update invalidates cached line" {
 
     _ = el.render_object.?.layout(layout_mod.BoxConstraints.tight(.{ .width = 400, .height = 100 }));
     const ro: *RenderText = @fieldParentPtr("base", el.render_object.?);
-    try std.testing.expect(ro.line != null);
+    try std.testing.expect(ro.para != null);
 
     var t2 = Text{ .text = "Bye", .font = &font, .size = 16, .color = geom.Color.rgb(0, 1, 0) };
     try t2.widget().update(el, &bctx);
-    try std.testing.expect(ro.line == null);
+    try std.testing.expect(ro.para == null);
 }
 
 test "Text with null font/color resolves from the theme; explicit wins" {
@@ -335,4 +368,61 @@ test "Text explicit font/color wins over theme" {
     try std.testing.expect(ro.font == &font);
     try std.testing.expectEqual(explicit_color, ro.color);
     try std.testing.expectEqual(explicit_size, ro.size);
+}
+
+test "a Text that does not ask to wrap keeps running past its box, as it always has" {
+    const gpa = std.testing.allocator;
+    var h = try phantom.testing.mount(gpa, blk: {
+        const t = Text{ .text = "a string far longer than the box it is given", .size = 16 };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    h.viewport = .{ .width = 60, .height = 200 };
+    try h.pump();
+
+    const el = h.root;
+    const ro: *RenderText = @fieldParentPtr("base", el.render_object.?);
+    // One line, however narrow the box: turning wrapping on for everyone would
+    // change the height of every existing layout that sits in a narrow box.
+    try std.testing.expectEqual(@as(usize, 1), ro.para.?.lines.len);
+}
+
+test "a wrapping Text breaks to the width it was given and grows taller instead of wider" {
+    const gpa = std.testing.allocator;
+    var h = try phantom.testing.mount(gpa, blk: {
+        const t = Text{ .text = "a string far longer than the box it is given", .size = 16, .wrap = true };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    h.viewport = .{ .width = 120, .height = 400 };
+    try h.pump();
+
+    const ro: *RenderText = @fieldParentPtr("base", h.root.render_object.?);
+    const p = ro.para.?;
+    try std.testing.expect(p.lines.len > 1);
+    for (p.lines) |l| try std.testing.expect(l.width <= 120);
+    // Taller than one line, which is the whole point of wrapping.
+    try std.testing.expect(p.height > p.lines[0].height);
+}
+
+test "a wrapping Text stacks its lines down the box rather than drawing them on top of each other" {
+    const gpa = std.testing.allocator;
+    var h = try phantom.testing.mount(gpa, blk: {
+        const t = Text{ .text = "one two three four five six seven", .size = 16, .wrap = true };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 400 };
+    try h.pump();
+
+    // Every line reaches the display list, each at its own origin. Painting them
+    // all at the same y would look like one unreadable line.
+    var ys: std.ArrayList(f32) = .empty;
+    defer ys.deinit(gpa);
+    for (h.canvas.list.primitives.items) |prim| {
+        if (prim == .text) try ys.append(gpa, prim.text.origin.y);
+    }
+    const ro: *RenderText = @fieldParentPtr("base", h.root.render_object.?);
+    try std.testing.expectEqual(ro.para.?.lines.len, ys.items.len);
+    for (ys.items[1..], 0..) |y, i| try std.testing.expect(y > ys.items[i]);
 }

@@ -49,6 +49,135 @@ pub fn keyScrollDelta(
     };
 }
 
+/// The least offset that shows all of `rect`. Both are in content coordinates, so
+/// the caller has already taken the viewport's own position out. A rect larger than
+/// the viewport lines up with its start edge, because the start of an item is what a
+/// reader needs first.
+pub fn offsetToShow(
+    offset: geom.PhysicalOffset,
+    rect: geom.PhysicalRect,
+    viewport: geom.PhysicalSize,
+) geom.PhysicalOffset {
+    return .{
+        .x = axisOffsetToShow(offset.x, rect.x, rect.width, viewport.width),
+        .y = axisOffsetToShow(offset.y, rect.y, rect.height, viewport.height),
+    };
+}
+
+fn axisOffsetToShow(offset: f32, start: f32, extent: f32, viewport: f32) f32 {
+    if (start < offset) return start;
+    // Showing the end of a rect this long would push its start out of sight, and a
+    // reader needs the start first.
+    if (extent > viewport) return start;
+    const end = start + extent;
+    if (end > offset + viewport) return end - viewport;
+    // Already in view, so the reader's place is kept.
+    return offset;
+}
+
+/// The parts of a scrolling render object a `ScrollController` drives, without
+/// naming which widget owns them.
+///
+/// `ScrollView` and `GridView` scroll identically: both clamp `offset + delta`
+/// against the same content and viewport, through the same `clampOffset`.
+/// Pointing the controller at the fields rather than at one render object type
+/// is what lets one controller serve both, instead of `GridView` growing a
+/// second copy of the same methods.
+///
+/// The pointers reach into the render object, so a handle is valid only while
+/// that object is mounted. `detach` is what keeps that true.
+pub const Scrollable = struct {
+    node: *RenderObject,
+    offset: *geom.PhysicalOffset,
+    content: *const geom.PhysicalSize,
+    viewport: *const geom.PhysicalSize,
+};
+
+/// The handle an application holds to reach a mounted scrolling widget. The scroll
+/// offset lives on the render object, which the widget tree owns and rebuilds, so a
+/// controller is the only stable thing a caller can keep across frames. It does not
+/// own the view: the view attaches itself while it is mounted and detaches before it
+/// is freed, which is why every method reports whether it reached anything.
+///
+/// One controller drives one view. Giving the same controller to two mounted
+/// scrolling widgets leaves it pointing at whichever mounted last.
+pub const ScrollController = struct {
+    view: ?Scrollable = null,
+
+    /// True while a mounted `ScrollView` uses this controller.
+    pub fn attached(self: *const ScrollController) bool {
+        return self.view != null;
+    }
+
+    /// Where the content is scrolled to, or null while detached.
+    pub fn offset(self: *const ScrollController) ?geom.PhysicalOffset {
+        const v = self.view orelse return null;
+        return v.offset.*;
+    }
+
+    /// The furthest the content can scroll, or null while detached. Zero on both
+    /// axes until the first layout, because nothing is known about the content yet.
+    pub fn maxOffset(self: *const ScrollController) ?geom.PhysicalOffset {
+        const v = self.view orelse return null;
+        return .{
+            .x = @max(@as(f32, 0), v.content.width - v.viewport.width),
+            .y = @max(@as(f32, 0), v.content.height - v.viewport.height),
+        };
+    }
+
+    /// Scroll to an absolute offset, clamped to what the content allows. Returns
+    /// false while detached.
+    pub fn jumpTo(self: *ScrollController, to: geom.PhysicalOffset) bool {
+        const v = self.view orelse return false;
+        v.offset.* = clampOffset(to, v.content.*, v.viewport.*);
+        return true;
+    }
+
+    /// Add to the offset, clamped the same way a wheel event is. Returns false while
+    /// detached.
+    pub fn scrollBy(self: *ScrollController, dx: f32, dy: f32) bool {
+        const v = self.view orelse return false;
+        // The same clamp both scrolling render objects apply to a wheel event.
+        v.offset.* = clampOffset(
+            .{ .x = v.offset.x + dx, .y = v.offset.y + dy },
+            v.content.*,
+            v.viewport.*,
+        );
+        return true;
+    }
+
+    /// Scroll the least amount that puts `rect` in view. The rect is in content
+    /// coordinates, where the top left of the content is the origin. Returns false
+    /// while detached.
+    pub fn scrollIntoView(self: *ScrollController, rect: geom.PhysicalRect) bool {
+        const v = self.view orelse return false;
+        v.offset.* = clampOffset(offsetToShow(v.offset.*, rect, v.viewport.*), v.content.*, v.viewport.*);
+        return true;
+    }
+
+    /// Scroll the least amount that puts one render object of the content in view.
+    /// Returns false while detached, or when the view and the child have not both
+    /// been painted yet: a render object learns where it sits from the paint pass,
+    /// so there is nothing to aim at before the first frame.
+    ///
+    /// `child` must be inside this view. A render object from elsewhere in the tree
+    /// gives a meaningless rectangle rather than an error, because the render tree
+    /// holds no upward link to check it against.
+    pub fn showChild(self: *ScrollController, child: *RenderObject) bool {
+        const v = self.view orelse return false;
+        // The child is painted at the view's own paint origin plus its position in
+        // the content. The scroll offset is applied by the backend from the pushed
+        // scroll region, not by the paint offset, so the difference of the two
+        // origins is the content coordinate with no offset to undo.
+        return self.scrollIntoView(.{
+            .x = child.origin.x - v.node.origin.x,
+            .y = child.origin.y - v.node.origin.y,
+            .width = child.size.width,
+            .height = child.size.height,
+        });
+    }
+};
+
 const RenderScrollView = struct {
     base: RenderObject,
     gpa: std.mem.Allocator,
@@ -58,6 +187,10 @@ const RenderScrollView = struct {
     viewport: geom.PhysicalSize = geom.PhysicalSize.zero,
     handlers: pointer.PointerHandlers,
     focus_handlers: phantom.FocusHandlers = undefined,
+    /// The copy of the config's id that `focus_handlers.id` points at.
+    id: phantom.focus.OwnedId = .{},
+    /// The controller this view is attached to, kept so `destroyFn` can detach.
+    controller: ?*ScrollController = null,
     axis: ScrollView.Axis = .vertical,
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
@@ -110,7 +243,34 @@ const RenderScrollView = struct {
 
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
         const self: *RenderScrollView = @fieldParentPtr("base", base);
+        self.detach();
+        self.id.deinit(gpa);
         gpa.destroy(self);
+    }
+
+    /// Point the controller at this view. A controller that already drives another
+    /// view is taken over, because the widget that named it here is the live one.
+    fn attach(self: *RenderScrollView, controller: ?*ScrollController) void {
+        if (self.controller == controller) return;
+        self.detach();
+        self.controller = controller;
+        if (controller) |c| c.view = .{
+            .node = &self.base,
+            .offset = &self.offset,
+            .content = &self.content,
+            .viewport = &self.viewport,
+        };
+    }
+
+    /// Clear the controller, but only while it still points here. A rebuild that
+    /// moved the controller to another view must not have its new target erased by
+    /// this view being freed afterwards.
+    fn detach(self: *RenderScrollView) void {
+        const c = self.controller orelse return;
+        if (c.view) |v| {
+            if (v.node == &self.base) c.view = null;
+        }
+        self.controller = null;
     }
 
     fn adopt(base: *RenderObject, child: ?*RenderObject) void {
@@ -141,7 +301,12 @@ const RenderScrollView = struct {
     fn installHandlers(self: *RenderScrollView) void {
         self.handlers = .{ .ctx = self, .on_scroll = scrollThunk };
         self.base.pointer = &self.handlers;
-        self.focus_handlers = .{ .ctx = self, .on_key = onKey };
+        self.focus_handlers = .{
+            .ctx = self,
+            .on_key = onKey,
+            .id = self.id.text,
+            .node = &self.base,
+        };
         self.base.focus = &self.focus_handlers;
     }
 };
@@ -149,6 +314,14 @@ const RenderScrollView = struct {
 pub const ScrollView = struct {
     child: Widget,
     axis: Axis = .vertical,
+    /// The handle an application scrolls this view through. The view attaches itself
+    /// to it on mount and detaches on unmount, so the caller only has to keep the
+    /// controller alive for as long as the widget is mounted.
+    controller: ?*ScrollController = null,
+    /// The name `FocusManager.focusById` moves the keyboard focus here by. A view
+    /// with no focusable children needs this to be reached by the arrow keys. The
+    /// text is copied on mount, so a caller may build it in the frame arena.
+    id: ?[]const u8 = null,
 
     pub const Axis = enum { vertical, horizontal, both };
 
@@ -172,8 +345,15 @@ pub const ScrollView = struct {
             .handlers = .{ .ctx = ro },
             .axis = self.axis,
         };
+        ro.id.set(gpa, self.id) catch |e| {
+            gpa.destroy(ro);
+            return e;
+        };
         ro.installHandlers();
+        ro.attach(self.controller);
         const el = gpa.create(Element) catch |e| {
+            ro.detach();
+            ro.id.deinit(gpa);
             gpa.destroy(ro);
             return e;
         };
@@ -195,6 +375,9 @@ pub const ScrollView = struct {
         const self: *const ScrollView = @ptrCast(@alignCast(ptr));
         const ro: *RenderScrollView = @fieldParentPtr("base", el.render_object.?);
         ro.axis = self.axis;
+        try ro.id.set(ro.gpa, self.id);
+        ro.installHandlers();
+        ro.attach(self.controller);
         el.child = try el.updateChild(el.child, self.child, bctx);
         ro.base.adoptChild(if (el.child) |c| c.renderObject() else null);
     }
@@ -428,6 +611,286 @@ test "End jumps to the bottom and clamps there, Home returns to the top" {
     // exactly zero in the other direction.
     try std.testing.expect(handlers.on_key.?(handlers.ctx, .{ .keysym = .home }));
     try std.testing.expectEqual(@as(f32, 0), scrollOffsetOf(ro));
+}
+
+test "offsetToShow leaves the offset alone when the rect is already in view" {
+    const vp = geom.PhysicalSize{ .width = 100, .height = 100 };
+    const got = offsetToShow(.{ .x = 0, .y = 500 }, .{ .x = 0, .y = 520, .width = 100, .height = 40 }, vp);
+    try std.testing.expectEqual(@as(f32, 500), got.y);
+}
+
+test "offsetToShow moves down by the least amount that shows the end of the rect" {
+    const vp = geom.PhysicalSize{ .width = 100, .height = 100 };
+    // The rect runs 500..600 and the view shows 0..100, so the bottom edge decides.
+    const got = offsetToShow(.zero, .{ .x = 0, .y = 500, .width = 100, .height = 100 }, vp);
+    try std.testing.expectEqual(@as(f32, 500), got.y);
+}
+
+test "offsetToShow moves up to the start of a rect above the view" {
+    const vp = geom.PhysicalSize{ .width = 100, .height = 100 };
+    const got = offsetToShow(.{ .x = 0, .y = 500 }, .{ .x = 0, .y = 220, .width = 100, .height = 40 }, vp);
+    try std.testing.expectEqual(@as(f32, 220), got.y);
+}
+
+test "offsetToShow lines a rect taller than the viewport up with its start" {
+    const vp = geom.PhysicalSize{ .width = 100, .height = 100 };
+    // Neither edge fits, so showing the end would hide the start. The start wins.
+    const got = offsetToShow(.zero, .{ .x = 0, .y = 200, .width = 100, .height = 400 }, vp);
+    try std.testing.expectEqual(@as(f32, 200), got.y);
+}
+
+test "offsetToShow scrolls each axis on its own" {
+    const vp = geom.PhysicalSize{ .width = 100, .height = 100 };
+    // The rect is right of the view and already inside it vertically.
+    const got = offsetToShow(.{ .x = 0, .y = 50 }, .{ .x = 300, .y = 60, .width = 20, .height = 20 }, vp);
+    try std.testing.expectEqual(@as(f32, 220), got.x);
+    try std.testing.expectEqual(@as(f32, 50), got.y);
+}
+
+// ---------------------------------------------------------------------------
+// Reaching a mounted view through a ScrollController
+// ---------------------------------------------------------------------------
+
+/// Ten stacked rows of 100 physical units each, so the content is 1000 tall inside
+/// a 100 tall viewport and every row has a known content coordinate.
+const RowList = struct {
+    leaf: phantom.ColoredBox = .{ .color = geom.Color.rgb(0, 1, 0) },
+    rows: [10]phantom.SizedBox = undefined,
+    widgets: [10]phantom.Widget = undefined,
+
+    fn column(self: *RowList) phantom.Flex {
+        for (&self.rows, 0..) |*row, i| {
+            row.* = .{ .width = 100, .height = 100, .child = self.leaf.widget() };
+            self.widgets[i] = row.widget();
+        }
+        return phantom.Column(.{ .main = .start, .cross = .start, .children = &self.widgets });
+    }
+};
+
+fn pushScrollOffset(prims: []const phantom.Primitive) ?geom.PhysicalOffset {
+    for (prims) |p| {
+        switch (p) {
+            .push_scroll => |sr| return sr.offset,
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "a ScrollController moves the offset of the view it is attached to, and the paint follows" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    try std.testing.expect(ctl.attached());
+    try std.testing.expectEqual(@as(f32, 0), ctl.offset().?.y);
+
+    try std.testing.expect(ctl.scrollBy(0, 250));
+    try std.testing.expectEqual(@as(f32, 250), ctl.offset().?.y);
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = 40 }));
+    try std.testing.expectEqual(@as(f32, 40), ctl.offset().?.y);
+
+    // The offset is only worth anything if the next frame draws at it.
+    try h.pump();
+    try std.testing.expectEqual(@as(f32, 40), pushScrollOffset(h.canvas.list.primitives.items).?.y);
+}
+
+test "a ScrollController reports the last offset the content allows and clamps to it" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    // Ten rows of 100 in a viewport of 100 leaves 900 to scroll through.
+    try std.testing.expectEqual(@as(f32, 900), ctl.maxOffset().?.y);
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = 99999 }));
+    try std.testing.expectEqual(@as(f32, 900), ctl.offset().?.y);
+    try std.testing.expect(ctl.scrollBy(0, -99999));
+    try std.testing.expectEqual(@as(f32, 0), ctl.offset().?.y);
+}
+
+test "a ScrollController that no view uses reports nothing and refuses every move" {
+    var ctl = ScrollController{};
+    try std.testing.expect(!ctl.attached());
+    try std.testing.expect(ctl.offset() == null);
+    try std.testing.expect(ctl.maxOffset() == null);
+    // An application that built its controller before the first build must be told
+    // the call did nothing, rather than believing it scrolled.
+    try std.testing.expect(!ctl.jumpTo(.{ .x = 0, .y = 10 }));
+    try std.testing.expect(!ctl.scrollBy(0, 10));
+    try std.testing.expect(!ctl.scrollIntoView(.{ .x = 0, .y = 0, .width = 10, .height = 10 }));
+}
+
+test "unmounting a ScrollView detaches its controller" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+    try std.testing.expect(ctl.scrollBy(0, 100));
+
+    h.deinit();
+    // The render object is freed now, so a controller that still pointed at it
+    // would write through a dangling pointer on the next scroll.
+    try std.testing.expect(!ctl.attached());
+    try std.testing.expect(!ctl.scrollBy(0, 100));
+}
+
+test "scrollIntoView brings a row below the viewport just inside the bottom edge" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    // Row 5 covers content y 500..600.
+    try std.testing.expect(ctl.scrollIntoView(.{ .x = 0, .y = 500, .width = 100, .height = 100 }));
+    try std.testing.expectEqual(@as(f32, 500), ctl.offset().?.y);
+    // Asking again for a row that is now in view must not move anything.
+    try std.testing.expect(ctl.scrollIntoView(.{ .x = 0, .y = 500, .width = 100, .height = 100 }));
+    try std.testing.expectEqual(@as(f32, 500), ctl.offset().?.y);
+    // Row 0 is above the view, so it comes back to the top.
+    try std.testing.expect(ctl.scrollIntoView(.{ .x = 0, .y = 0, .width = 100, .height = 100 }));
+    try std.testing.expectEqual(@as(f32, 0), ctl.offset().?.y);
+}
+
+test "showChild scrolls a child render object into view and lands on the same offset twice" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    const column_el = h.root.child orelse return error.NoColumnElement;
+    const row7 = column_el.children.items[7].renderObject() orelse return error.NoRowRenderObject;
+
+    try std.testing.expect(ctl.showChild(row7));
+    // Row 7 covers content y 700..800, so its bottom edge decides the offset.
+    try std.testing.expectEqual(@as(f32, 700), ctl.offset().?.y);
+
+    // A second frame repaints at the new offset. The child's recorded origin must
+    // still be a content coordinate, or the view would creep further on each call.
+    try h.pump();
+    try std.testing.expect(ctl.showChild(row7));
+    try std.testing.expectEqual(@as(f32, 700), ctl.offset().?.y);
+}
+
+// ---------------------------------------------------------------------------
+// Reaching a mounted view through the keyboard
+// ---------------------------------------------------------------------------
+
+test "a ScrollView with an id takes the focus by name and then scrolls on the arrow keys" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = geom.Color.rgb(0, 1, 0) };
+    var child = tallContent(&leaf);
+    var sv = ScrollView{ .id = "log", .child = child.widget() };
+    // The manager is torn down after the tree, because unmounting the tree calls
+    // back into it to forget each freed focus node.
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    try h.pump();
+
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+
+    try std.testing.expect(mgr.focusById("log"));
+    try std.testing.expect(mgr.dispatch(.{ .keysym = .down }));
+    try std.testing.expect(scrollOffsetOf(h.root.renderObject().?) > 0);
+}
+
+test "a rebuilt ScrollView answers to its new id and no longer to the old one" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = geom.Color.rgb(0, 1, 0) };
+    var child = tallContent(&leaf);
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var before = ScrollView{ .id = "old", .child = child.widget() };
+    var h = try testing.mount(gpa, before.widget());
+    defer h.deinit();
+    try h.pump();
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+    try std.testing.expect(mgr.focusById("old"));
+
+    var bctx = phantom.BuildContext{ .arena = h.arena.allocator(), .owner = h.owner };
+    var after = ScrollView{ .id = "new", .child = child.widget() };
+    try after.widget().update(h.root, &bctx);
+    try mgr.collect(gpa, h.root);
+
+    try std.testing.expect(mgr.focusById("new"));
+    try std.testing.expect(!mgr.focusById("old"));
+}
+
+test "a rebuilt ScrollView moves its controller to the widget that names it" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = geom.Color.rgb(0, 1, 0) };
+    var child = tallContent(&leaf);
+    var ctl = ScrollController{};
+    var before = ScrollView{ .child = child.widget() };
+    var h = try testing.mount(gpa, before.widget());
+    defer h.deinit();
+    try h.pump();
+    // A view built with no controller must not be reachable through one.
+    try std.testing.expect(!ctl.attached());
+
+    var bctx = phantom.BuildContext{ .arena = h.arena.allocator(), .owner = h.owner };
+    var after = ScrollView{ .controller = &ctl, .child = child.widget() };
+    try after.widget().update(h.root, &bctx);
+    try h.pump();
+
+    // A rebuild that adds a controller has to attach it, or an application that
+    // wires one up after the first frame never reaches the view.
+    try std.testing.expect(ctl.attached());
+    try std.testing.expect(ctl.scrollBy(0, 40));
+    try std.testing.expectEqual(@as(f32, 40), ctl.offset().?.y);
+}
+
+test "a key the focused child refuses scrolls the ScrollView that encloses it" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = geom.Color.rgb(0, 1, 0) };
+    var child = tallContent(&leaf);
+    // The row takes the focus and handles no keys of its own, which is the shape of
+    // a selectable list item.
+    var row = phantom.Focus{ .id = "row", .child = child.widget() };
+    var sv = ScrollView{ .child = row.widget() };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    try h.pump();
+
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+
+    try std.testing.expect(mgr.focusById("row"));
+    try std.testing.expect(mgr.dispatch(.{ .keysym = .page_down }));
+    try std.testing.expect(scrollOffsetOf(h.root.renderObject().?) > 0);
+    // The key scrolled the view, and the row kept the focus.
+    try std.testing.expectEqualStrings("row", mgr.focusedId().?);
 }
 
 test "ScrollView vertical axis: Column child lays out to natural stacked height, not 0" {
