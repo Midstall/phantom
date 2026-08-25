@@ -4,17 +4,17 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .prism = .{
-            .url = "git+https://github.com/Midstall/prism#d50303f2302c161ff3e9fadbb24f990248fe1e0f",
-            .hash = "prism-0.1.0-PSE12N28OACyQoAXy3yrAXyMxthCSa6ur1TgjVpCL0c_",
-        },
         .webidl = .{
             .url = "git+https://github.com/Midstall/webidl.zig#4b0d3c61d5f22e6072e9eacf03174e4e8393c6a2",
             .hash = "webidl_zig-0.1.0-FrIyV_uUBgAGtNwP-OkLegPJMWUnpeKuPqDdVbWyC9Fn",
         },
         .lattice = .{
-            .url = "git+https://github.com/Midstall/lattice#9f0a9b128dcf012e3760f440e4f5cd9562ec8752",
-            .hash = "lattice-0.1.0-TdtxHEviCQCoi6o8R_6d05KlMo2iVFGryVFpGbDEW81-",
+            .url = "git+https://github.com/Midstall/lattice#17053e425b5e472f3a6a57a382fad18b0b4ea356",
+            .hash = "lattice-0.1.0-TdtxHEviCQCHdTwR8eVLuDYwIIKcxFQLjQs18onvIC1q",
+        },
+        .prism = .{
+            .url = "git+https://github.com/Midstall/prism#f24fce92e8306e581c1e6fa6fe36c924183bab6a",
+            .hash = "prism-0.1.0-PSE12AbIOAAMnhpTrIYz4xOe1wphrH0hdEBig6v50waz",
         },
     },
     .paths = .{ "build", "build.zig", "build.zig.zon", "lib" },
