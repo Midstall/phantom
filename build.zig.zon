@@ -9,12 +9,12 @@
             .hash = "webidl_zig-0.1.0-FrIyV_uUBgAGtNwP-OkLegPJMWUnpeKuPqDdVbWyC9Fn",
         },
         .lattice = .{
-            .url = "git+https://github.com/Midstall/lattice#e22083d29efc14d30887888eded76424bf25b72e",
-            .hash = "lattice-0.1.0-TdtxHEviCQCZaOH7y3ls5kW8sWTefXfiT8g-MUJy913z",
+            .url = "git+https://github.com/Midstall/lattice#f6a794d2e6c4f739cd7871d733cfed6f60e13be5",
+            .hash = "lattice-0.1.0-TdtxHEviCQDE_w6bvVIHOoVTEpJozwuGCuddpQ_Bwi8I",
         },
         .prism = .{
-            .url = "git+https://github.com/Midstall/prism#2b50ec14c7e6c0795c22f9778483d0954ff7550f",
-            .hash = "prism-0.1.0-PSE12EzaOADdJQZq2Z9qoEC978am8KnR-bX117W6SpoQ",
+            .url = "git+https://github.com/Midstall/prism#70b651960462bebaafd1b16078def3b1436ddf76",
+            .hash = "prism-0.1.0-PSE12EzaOACzVMMeBTTt29Asyo9_fvxiMJ64Hao59HXk",
         },
     },
     .paths = .{
