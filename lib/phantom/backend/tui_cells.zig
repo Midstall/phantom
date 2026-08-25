@@ -11,6 +11,7 @@ const DisplayList = dl.DisplayList;
 const text = @import("../text.zig");
 const mono = @import("../text/mono.zig");
 const image_mod = @import("../image/Image.zig");
+const icon_builtin = @import("../icon/builtin.zig");
 const Attrs = grid_mod.Attrs;
 
 pub const Ctx = struct {
@@ -274,7 +275,6 @@ fn averageColor(img: *image_mod) Rgb {
 }
 
 fn paintIconFallback(grid: *CellGrid, p: dl.IconPrimitive, ctx: Ctx) void {
-    // One solid block. The icon shape needs a graphics protocol, and mode B has none.
     const rect = geom.PhysicalRect{
         .x = p.origin.x,
         .y = p.origin.y,
@@ -283,7 +283,40 @@ fn paintIconFallback(grid: *CellGrid, p: dl.IconPrimitive, ctx: Ctx) void {
     };
     const b = cellBounds(rect, ctx, grid);
     const color = Rgb.fromColor(p.color);
+
+    // A mark that has no coverage draws nothing, which is what the block below
+    // does at alpha zero. Any coverage above that draws the whole character: a
+    // cell is either the character or it is not, so there is no partly drawn
+    // one. `paintText` treats its own colour the same way.
+    if (p.color.a <= 0) return;
+
+    if (icon_builtin.cellMarkFor(p.id)) |mark| {
+        paintCellMark(grid, b, mark, color);
+        return;
+    }
+    // No character means this mark, so it degrades to one solid block. The icon
+    // shape needs a graphics protocol, and mode B has none.
     fillCellRect(grid, b, color, p.color.a);
+}
+
+/// Put `mark` into the cells of `b`, one character for a symbol and the whole
+/// box for a rule.
+fn paintCellMark(grid: *CellGrid, b: Bounds, mark: icon_builtin.CellMark, color: Rgb) void {
+    // An empty box means the mark sits off the grid, or rounded away to nothing.
+    if (b.c1 <= b.c0 or b.r1 <= b.r0) return;
+    if (mark.tile) {
+        var row = b.r0;
+        while (row < b.r1) : (row += 1) {
+            var col = b.c0;
+            while (col < b.c1) : (col += 1) grid.putChar(col, row, mark.cp, color, .{});
+        }
+        return;
+    }
+    // The middle of the box, biased left and up. A square mark is two cells wide
+    // whenever a cell is taller than it is wide, which is every terminal, and
+    // the box then has no true middle. Left is the better of the two: a mark
+    // usually leads the text beside it, and the far cell would put a gap there.
+    grid.putChar(b.c0 + (b.c1 - b.c0 - 1) / 2, b.r0 + (b.r1 - b.r0 - 1) / 2, mark.cp, color, .{});
 }
 
 /// Shift a rect by the current scroll offset. `RenderScrollView.paintFn` paints its
@@ -1014,4 +1047,114 @@ test "an extreme scroll offset does not crash the text or rect paths" {
     // coordinates far past what any cell index can represent.
     try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
     try std.testing.expectEqual(@as(u8, 0), g.cellAt(0, 0).?.bg.r);
+}
+
+test "a mark with a character becomes that character, not a block" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    // One cell, at the origin.
+    try list.append(gpa, .{ .icon = .{
+        .id = .check,
+        .size = 16,
+        .color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    const cell = g.cellAt(0, 0).?;
+    try std.testing.expectEqual(@as(u21, '\u{2713}'), cell.ch);
+    try std.testing.expectEqual(@as(u8, 255), cell.fg.r);
+    // A block would have painted the background instead, which is the bug this
+    // test is about: the tick has to be readable, so the cell keeps its own.
+    try std.testing.expectEqual(@as(u8, 0), cell.bg.r);
+}
+
+test "a rule fills every cell it covers, so a stacked rail has no gap" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    // Three cells tall, which is the shape a provenance rail asks for.
+    try list.append(gpa, .{ .icon = .{
+        .id = .rule_vertical,
+        .size = 48,
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    for (0..3) |row| {
+        try std.testing.expectEqual(@as(u21, '\u{2502}'), g.cellAt(0, @intCast(row)).?.ch);
+    }
+}
+
+test "a symbol taller than one cell draws once, not once for every cell" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .icon = .{
+        .id = .check,
+        .size = 48,
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    var ticks: usize = 0;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            if (g.cellAt(@intCast(col), @intCast(row)).?.ch == '\u{2713}') ticks += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), ticks);
+}
+
+test "a mark with no character keeps the block it always had" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .icon = .{
+        .id = .torii,
+        .size = 16,
+        .color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    try std.testing.expectEqual(@as(u8, 255), g.cellAt(0, 0).?.bg.r);
+}
+
+test "a mark with no coverage draws nothing" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .icon = .{
+        .id = .check,
+        .size = 16,
+        .color = .{ .r = 1, .g = 0, .b = 0, .a = 0 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    try std.testing.expectEqual(@as(u21, ' '), g.cellAt(0, 0).?.ch);
 }
