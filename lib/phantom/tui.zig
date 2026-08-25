@@ -112,21 +112,45 @@ fn textMetricsFor(m: Mode, cell_w: f32, cell_h: f32) phantom.text.mono.TextMetri
     };
 }
 
-/// The smallest rectangle that contains both `a` and `b`.
+/// How many damage images may stack over one base before the session sends a
+/// fresh full-screen one and frees them all.
 ///
-/// Mode A deletes the previous frame's image by id once the new one is placed,
-/// which frees exactly that image's own footprint and nothing else. If the new
-/// frame only transmitted its own small damage rectangle, the region the old
-/// image used to cover but the new one does not touch would go blank the moment
-/// the old id is freed. Growing the new frame's rectangle to also cover the
-/// previous one's footprint means the new image fully replaces it, so freeing the
-/// old id never uncovers anything. See `Session.renderPixels`.
-fn unionRect(a: tui_pixels.Rect, b: tui_pixels.Rect) tui_pixels.Rect {
-    const x0 = @min(a.x, b.x);
-    const y0 = @min(a.y, b.y);
-    const x1 = @max(a.x + a.w, b.x + b.w);
-    const y1 = @max(a.y + a.h, b.y + b.h);
-    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+/// Two bounds guard two different things and both are needed. This one caps how
+/// many placements the terminal has to composite for every cell it draws. The
+/// area rule beside it caps the WORK: once the overlays add up to a screenful,
+/// a full frame costs no more than what has already been spent, so the amortised
+/// cost never exceeds twice that of always sending full frames, and in the
+/// ordinary case of a small thing changing it is a tiny fraction of it.
+const max_overlays = 32;
+
+/// What the terminal already holds for mode A, which is what decides whether the
+/// next frame is a base or an overlay.
+const FrameState = struct {
+    /// Whether a full-screen image is on the terminal at all.
+    has_base: bool,
+    /// How many damage images are stacked on it.
+    overlays: usize,
+    /// How many pixels those add up to, counted with overlap.
+    overlay_pixels: u64,
+    /// Set when the session knows the terminal no longer shows what it thinks.
+    forced: bool,
+};
+
+/// Whether the next frame must be a full-screen base rather than an overlay.
+///
+/// Split out from `renderPixels` and made pure because it is a POLICY, and the
+/// policy is where this went wrong before: the old code grew the transmitted
+/// rectangle to cover the previous one and then stored the grown rectangle, so
+/// it could only ever grow. One full-screen frame, which the first frame always
+/// is, made every later frame full-screen too. A rule that can only ratchet one
+/// way is not visible by reading the frame path, and it is very visible in a
+/// test that feeds it the same small damage twice.
+fn needsBase(state: FrameState, damage_pixels: u64, screen_pixels: u64) bool {
+    if (state.forced or !state.has_base) return true;
+    if (state.overlays >= max_overlays) return true;
+    // `>=` and not `>`: at exactly one screenful the two cost the same, and the
+    // base is worth more, because it also frees every overlay behind it.
+    return state.overlay_pixels + damage_pixels >= screen_pixels;
 }
 
 /// Where a damage rectangle lands once it is placed on the cell grid: the crop
@@ -449,8 +473,26 @@ pub const Session = struct {
     /// frame can free it by id once it has been fully replaced. Null before the
     /// first pixels frame, and reset on every resize, since the footprint's
     /// coordinates stop meaning anything once the surface changes size.
-    prev_id: ?u32,
-    prev_footprint: ?tui_pixels.Rect,
+    /// The id of the full-screen image everything else is drawn on top of, or
+    /// null before the first one is sent.
+    base_id: ?u32,
+    /// The ids of the damage images placed over the base since it was sent, in
+    /// the order they were placed. Freed together at the next rebase.
+    overlays: std.ArrayList(u32),
+    /// How many pixels those overlays cover in total, counted with overlap: it
+    /// is a measure of work spent, not of area covered. Once it reaches a whole
+    /// screen, a fresh full-screen image costs no more than what has already
+    /// been sent, so it is time to send one.
+    overlay_pixels: u64,
+    /// Send a full-screen image on the next frame whatever the damage says.
+    /// Set when the geometry changed under the session, or when something other
+    /// than the session wrote to the screen.
+    rebase: bool,
+    /// The display list this session last drew. Mode A compares against it
+    /// before touching the GPU, because reading one frame back costs about a
+    /// second at a real terminal size and an idle loop was paying that ten times
+    /// a second for a screen nobody had changed.
+    snapshot: phantom.display_list.Snapshot,
 
     frame: std.ArrayList(u8),
     decoder: decode.Decoder,
@@ -636,8 +678,11 @@ pub const Session = struct {
             null;
         errdefer if (self.surface) |*s| s.deinit();
         self.image_id = 1;
-        self.prev_id = null;
-        self.prev_footprint = null;
+        self.base_id = null;
+        self.overlays = .empty;
+        self.overlay_pixels = 0;
+        self.rebase = false;
+        self.snapshot = .{};
 
         self.frame = .empty;
         self.decoder = .{ .pixels = self.caps.sgr_pixel_mouse and self.mode == .pixels };
@@ -660,6 +705,8 @@ pub const Session = struct {
     /// removed, so a signal arriving during teardown still finds a live restore.
     pub fn deinit(self: *Session) void {
         self.frame.deinit(self.gpa);
+        self.overlays.deinit(self.gpa);
+        self.snapshot.deinit(self.gpa);
         if (self.surface) |*s| s.deinit();
         self.grid.deinit();
         self.canvas.deinit();
@@ -742,14 +789,18 @@ pub const Session = struct {
             @intFromFloat(self.viewport.width),
             @intFromFloat(self.viewport.height),
         );
-        // 4c. The previous frame's footprint was measured in the old surface's
-        //     coordinates. A shrink can put it outside the new surface entirely,
-        //     so it cannot seed the next frame's union rectangle: the next
-        //     damaged frame falls back to just its own damage, which
-        //     `PixelSurface.resize` already forces to cover the whole surface.
-        //     `prev_id` is untouched: freeing an id does not depend on geometry,
-        //     so it is still deleted normally once the next frame supersedes it.
-        self.prev_footprint = null;
+        // 4c. Every image on the terminal describes the OLD geometry, so the
+        //     next frame has to be a fresh full-screen base. That also frees
+        //     them: the rebase deletes the old base and every overlay once the
+        //     new one is placed, which is the only thing that reclaims images
+        //     sized for a window that no longer exists.
+        self.rebase = true;
+        // 4d. The screen was cleared and the surface resized, so the next frame
+        //     must be drawn whatever the display list says. A relayout usually
+        //     changes the list anyway, but a grid that resized without moving
+        //     anything would otherwise compare equal and draw nothing onto a
+        //     screen that no longer holds it.
+        self.snapshot.reset();
         // 5. MediaQuery.of reports the logical size, so widgets see stable
         //    numbers even though the physical one just changed underneath.
         self.owner.setActiveViewMetrics(.{
@@ -954,6 +1005,18 @@ pub const Session = struct {
     }
 
     fn renderPixels(self: *Session) !void {
+        // Asked BEFORE the GPU is touched, and this is the whole reason the
+        // snapshot exists. `PixelSurface.damage` answers the same question more
+        // precisely, but only after `renderFrame` has read the pixels back, and
+        // that readback measured 1.05 SECONDS for one 3002x1665 frame: the loop
+        // was spending a second of every tenth of a second to find out that a
+        // still screen was still. Comparing the display list costs microseconds
+        // and answers it before any of that.
+        //
+        // Conservative in the safe direction: a list that differs still goes
+        // through `damage`, so a change that happens to produce identical pixels
+        // costs one readback and still transmits nothing.
+        if (!try self.snapshot.differs(self.gpa, self.canvas.list)) return;
         const s = &self.surface.?;
         const pixels = try s.renderFrame(self.canvas.list, phantom.ColorScheme.tokyoNight().bg);
         // `damage` returns null on an unchanged frame, and nothing below runs:
@@ -961,29 +1024,68 @@ pub const Session = struct {
         // nothing at all, or every idle tick would retransmit the whole image
         // and saturate the pty.
         const r = s.damage(pixels) orelse return;
-        // Grown to also cover whatever the visible image occupies, not just this
-        // frame's own damage. The new image is about to fully replace the old
-        // one (the old id is freed below), so its footprint must be a superset
-        // of the old one's, or the region the new frame does not touch would go
-        // blank the moment the old id's data is freed.
-        const want = if (self.prev_footprint) |pf| unionRect(pf, r) else r;
-        const a = alignDamageToCells(want, self.cell_w, self.cell_h);
-        const crop = try s.cropRect(self.gpa, pixels, a.crop);
+        const a = alignDamageToCells(r, self.cell_w, self.cell_h);
+
+        // A frame is either a fresh BASE, which covers the screen and retires
+        // everything sent before it, or an OVERLAY, which covers only what
+        // changed and is composited on top of the base by the terminal.
+        //
+        // Sending a base every frame is what this code used to do, and it was
+        // not a choice: the old id was deleted as soon as the new one was
+        // placed, deleting an image takes its placement off the screen with it,
+        // so each new image had to cover everything the last one showed. The
+        // first frame covers the screen by definition, so every frame after it
+        // did too, for ever. That cost 1990 ms per frame at 3002x1665, almost
+        // all of it compressing 19 MB, against 47 ms for a 600x200 damage
+        // rectangle. Not deleting the old image is what breaks that chain.
+        const screen_pixels: u64 = @as(u64, @intFromFloat(self.viewport.width)) *
+            @as(u64, @intFromFloat(self.viewport.height));
+        const this_pixels: u64 = @as(u64, a.crop.w) * a.crop.h;
+        const send_base = needsBase(.{
+            .has_base = self.base_id != null,
+            .overlays = self.overlays.items.len,
+            .overlay_pixels = self.overlay_pixels,
+            .forced = self.rebase,
+        }, this_pixels, screen_pixels);
+
+        const rect: tui_pixels.Rect = if (send_base)
+            .{ .x = 0, .y = 0, .w = @intFromFloat(self.viewport.width), .h = @intFromFloat(self.viewport.height) }
+        else
+            a.crop;
+        const place: kitty_gfx.Placement = if (send_base)
+            .{ .col = 0, .row = 0, .z = 0 }
+        else
+            .{ .col = a.place.col, .row = a.place.row, .z = @intCast(self.overlays.items.len + 1) };
+
+        // Reserved BEFORE anything is written, so a failure to record the id
+        // cannot leave an image on the terminal that nothing will ever free.
+        if (!send_base) try self.overlays.ensureUnusedCapacity(self.gpa, 1);
+
+        const crop = try s.cropRect(self.gpa, pixels, rect);
         defer self.gpa.free(crop);
         if (self.caps.sync_output) try self.frame.appendSlice(self.gpa, ansi.sync_begin);
         try kitty_gfx.transmit(self.gpa, &self.frame, .{
             .id = self.image_id,
-            .width = a.crop.w,
-            .height = a.crop.h,
+            .width = rect.w,
+            .height = rect.h,
             .rgba = crop,
-        }, a.place);
-        // The old id is freed only after the new image is placed, so there is
-        // never a moment with nothing on screen: the new placement already
-        // covers everything the old one did.
-        if (self.prev_id) |pid| try kitty_gfx.deleteImage(self.gpa, &self.frame, pid);
+        }, place);
+
+        if (send_base) {
+            // Freed only after the new base is placed, so there is never a
+            // moment with nothing on screen: the base already covers everything
+            // any of them showed.
+            if (self.base_id) |id| try kitty_gfx.deleteImage(self.gpa, &self.frame, id);
+            for (self.overlays.items) |id| try kitty_gfx.deleteImage(self.gpa, &self.frame, id);
+            self.overlays.clearRetainingCapacity();
+            self.overlay_pixels = 0;
+            self.base_id = self.image_id;
+            self.rebase = false;
+        } else {
+            self.overlays.appendAssumeCapacity(self.image_id);
+            self.overlay_pixels += this_pixels;
+        }
         if (self.caps.sync_output) try self.frame.appendSlice(self.gpa, ansi.sync_end);
-        self.prev_footprint = a.crop;
-        self.prev_id = self.image_id;
         self.image_id = if (self.image_id >= 1_000_000) 1 else self.image_id + 1;
     }
 
@@ -1020,10 +1122,13 @@ pub const Session = struct {
     /// nothing at all. See `cell_grid.Positioning.relative`.
     pub fn invalidate(self: *Session) void {
         self.grid.invalidate();
-        // Mode A's damage tracking is the pixel equivalent of the front buffer,
-        // and the same reasoning applies: drop the previous footprint so the
-        // next frame cannot be diffed against a placement that has moved.
-        self.prev_footprint = null;
+        // The list did not change, but what is on screen did, so the next frame
+        // has to be drawn even though comparing would say otherwise.
+        self.snapshot.reset();
+        // Mode A composites a base and its overlays, and something else has
+        // just written over them, so no overlay can be trusted to still be
+        // showing what it was. Only a full-screen base puts that right.
+        self.rebase = true;
         if (self.surface) |*s| s.invalidate();
     }
 
@@ -1183,31 +1288,6 @@ test "textMetricsFor gives pixels mode the proportional metrics and ignores the 
     // into mode A's layout, which is the exact bug being fixed.
     const tm = textMetricsFor(.pixels, 40, 90);
     try std.testing.expectEqual(phantom.text.mono.TextMetrics.proportional, tm);
-}
-
-test "unionRect covers both rectangles when neither contains the other" {
-    const r = unionRect(
-        .{ .x = 10, .y = 10, .w = 5, .h = 5 }, // covers 10..14
-        .{ .x = 20, .y = 30, .w = 5, .h = 5 }, // covers 20..24, 30..34
-    );
-    try std.testing.expectEqual(tui_pixels.Rect{ .x = 10, .y = 10, .w = 15, .h = 25 }, r);
-}
-
-test "unionRect of a rectangle with itself is unchanged" {
-    const a = tui_pixels.Rect{ .x = 4, .y = 9, .w = 6, .h = 2 };
-    try std.testing.expectEqual(a, unionRect(a, a));
-}
-
-test "unionRect is not affected by argument order" {
-    const a = tui_pixels.Rect{ .x = 12, .y = 1, .w = 3, .h = 40 };
-    const b = tui_pixels.Rect{ .x = 0, .y = 5, .w = 50, .h = 1 };
-    try std.testing.expectEqual(unionRect(a, b), unionRect(b, a));
-}
-
-test "unionRect swallows a rectangle fully contained in the other" {
-    const outer = tui_pixels.Rect{ .x = 0, .y = 0, .w = 100, .h = 100 };
-    const inner = tui_pixels.Rect{ .x = 10, .y = 10, .w = 5, .h = 5 };
-    try std.testing.expectEqual(outer, unionRect(outer, inner));
 }
 
 test "alignDamageToCells leaves a rectangle already on a cell boundary unchanged" {
@@ -1843,4 +1923,101 @@ test "a session leaves stderr alone under the leave policy" {
     // its own logs somewhere safe keeps its stderr pointing where it put it.
     try std.testing.expect(h.session.term.saved_stderr == null);
     try std.testing.expect(h.session.term.stderr_target == null);
+}
+
+/// A screen big enough that the thresholds below are the only thing deciding.
+const test_screen: u64 = 3002 * 1665;
+
+test "the first frame of a run must be a full-screen base, because nothing is on the terminal yet" {
+    try std.testing.expect(needsBase(.{
+        .has_base = false,
+        .overlays = 0,
+        .overlay_pixels = 0,
+        .forced = false,
+    }, 100, test_screen));
+}
+
+test "small damage over an existing base stays an overlay, and does not ratchet" {
+    // The regression this whole scheme exists for. The old code grew the
+    // transmitted rectangle to cover the previous one and stored the result, so
+    // the second frame after a full-screen first frame was full-screen, and so
+    // was every frame after that for ever. Here the same small damage is offered
+    // repeatedly and has to stay small every time.
+    var state = FrameState{ .has_base = true, .overlays = 0, .overlay_pixels = 0, .forced = false };
+    const damage: u64 = 600 * 200;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try std.testing.expect(!needsBase(state, damage, test_screen));
+        state.overlays += 1;
+        state.overlay_pixels += damage;
+    }
+}
+
+test "a forced rebase wins over every other consideration" {
+    try std.testing.expect(needsBase(.{
+        .has_base = true,
+        .overlays = 0,
+        .overlay_pixels = 0,
+        .forced = true,
+    }, 1, test_screen));
+}
+
+test "enough overlays trigger a base even while their area stays small" {
+    // A pointer moving one cell at a time produces tiny damage for ever. Without
+    // the count bound the terminal would be asked to composite an unbounded
+    // stack of placements for every cell it draws.
+    const tiny: u64 = 16;
+    try std.testing.expect(!needsBase(.{
+        .has_base = true,
+        .overlays = max_overlays - 1,
+        .overlay_pixels = tiny * (max_overlays - 1),
+        .forced = false,
+    }, tiny, test_screen));
+    try std.testing.expect(needsBase(.{
+        .has_base = true,
+        .overlays = max_overlays,
+        .overlay_pixels = tiny * max_overlays,
+        .forced = false,
+    }, tiny, test_screen));
+}
+
+test "overlays adding up to a screenful trigger a base even while their count stays low" {
+    // Two big damage rectangles can reach a screenful long before the count
+    // bound does, and at that point a full frame costs no more than what has
+    // already been sent.
+    const half = test_screen / 2;
+    try std.testing.expect(!needsBase(.{
+        .has_base = true,
+        .overlays = 1,
+        .overlay_pixels = half,
+        .forced = false,
+    }, half - 1, test_screen));
+    try std.testing.expect(needsBase(.{
+        .has_base = true,
+        .overlays = 1,
+        .overlay_pixels = half,
+        .forced = false,
+    }, half, test_screen));
+}
+
+test "the amortised cost never exceeds twice that of sending a full frame every time" {
+    // Walk the rule the way the loop does and add up what it would send. The
+    // bound is what justifies overlays at all: they are only worth doing if the
+    // occasional full frame cannot make the total worse than the scheme they
+    // replaced.
+    var state = FrameState{ .has_base = true, .overlays = 0, .overlay_pixels = 0, .forced = false };
+    const damage: u64 = test_screen / 10;
+    var sent: u64 = 0;
+    var frames: u64 = 0;
+    while (frames < 200) : (frames += 1) {
+        if (needsBase(state, damage, test_screen)) {
+            sent += test_screen;
+            state = .{ .has_base = true, .overlays = 0, .overlay_pixels = 0, .forced = false };
+        } else {
+            sent += damage;
+            state.overlays += 1;
+            state.overlay_pixels += damage;
+        }
+    }
+    try std.testing.expect(sent < 2 * test_screen * frames);
 }
