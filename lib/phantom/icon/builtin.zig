@@ -42,6 +42,51 @@ pub const Id = enum(u32) {
     rule_horizontal = 11,
 };
 
+/// What a cell backend draws in place of the mark.
+pub const CellMark = struct {
+    /// The codepoint to put in the cell. Every one of them is a single column
+    /// wide, so a mark never pushes the text beside it out of place.
+    cp: u21,
+    /// True for a mark that continues past its own box. A rule fills every cell
+    /// it covers, because a line with a gap in it is a different line. A symbol
+    /// draws once, in the cell at the middle of the box, because a tick
+    /// repeated four times is four ticks.
+    tile: bool = false,
+};
+
+/// The character a cell backend draws for `id`, or null when no character means
+/// the mark and the backend must fall back to a block.
+///
+/// A cell backend cannot draw a path, but it does not need to: the terminal
+/// draws text with its own font, and a text font has these. This is the reverse
+/// of the reason the paths exist (see `Id`). The bundled display faces have no
+/// tick, so pixel mode draws one itself; the terminal font has one, so cell
+/// mode asks for it by number.
+///
+/// The four chevrons come out as the geometric triangles. A terminal font is
+/// much more likely to have those than any of the chevron ornaments, and they
+/// give the same direction, which is all the mark says.
+pub fn cellMarkFor(id: Id) ?CellMark {
+    return switch (id) {
+        // The logomark is a drawing of a gate. No character stands for it, so a
+        // cell backend keeps its block.
+        .torii => null,
+        .check => .{ .cp = '\u{2713}' },
+        .cross => .{ .cp = '\u{2717}' },
+        .chevron_left => .{ .cp = '\u{25C0}' },
+        .chevron_right => .{ .cp = '\u{25B6}' },
+        .chevron_up => .{ .cp = '\u{25B2}' },
+        .chevron_down => .{ .cp = '\u{25BC}' },
+        .arrow_right => .{ .cp = '\u{2192}' },
+        // Plus and minus are ASCII on purpose. Every font has them, and the
+        // typographic minus buys nothing at the size of one cell.
+        .plus => .{ .cp = '+' },
+        .minus => .{ .cp = '-' },
+        .rule_vertical => .{ .cp = '\u{2502}', .tile = true },
+        .rule_horizontal => .{ .cp = '\u{2500}', .tile = true },
+    };
+}
+
 /// The centreline of `id`.
 pub fn pathFor(id: Id) path.Path {
     return switch (id) {
@@ -195,6 +240,7 @@ pub const torii = path.Path{ .verbs = &.{
 const std = @import("std");
 const stroke = @import("stroke.zig");
 const raster = @import("../text/raster.zig");
+const mono = @import("../text/mono.zig");
 
 /// Coverage of the bitmap cell holding the grid point (x, y), or 0 when that
 /// cell lies outside the bitmap, which is the same thing as no coverage.
@@ -460,4 +506,30 @@ test "the check mark is a tick and not a V: its vertex sits left of centre" {
     // distinguishes a tick from a symmetric V.
     try std.testing.expectEqual(b.min_y, vertex.y);
     try std.testing.expect(vertex.x < grid / 2);
+}
+
+test "every mark a terminal font can draw is one column wide" {
+    // A mark two columns wide would push the text beside it out of place, and
+    // the cell backend has no way to know that happened.
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const id: Id = @enumFromInt(f.value);
+        if (cellMarkFor(id)) |mark| {
+            try std.testing.expectEqual(@as(u2, 1), mono.wcwidth(mark.cp));
+        }
+    }
+}
+
+test "only the rules tile, and every interface mark has a character" {
+    inline for (@typeInfo(Id).@"enum".fields) |f| {
+        const id: Id = @enumFromInt(f.value);
+        const mark = cellMarkFor(id);
+        if (id == .torii) {
+            // The logomark is a drawing, and no character means it.
+            try std.testing.expect(mark == null);
+            continue;
+        }
+        try std.testing.expect(mark != null);
+        const tiles = (id == .rule_vertical or id == .rule_horizontal);
+        try std.testing.expectEqual(tiles, mark.?.tile);
+    }
 }
