@@ -45,7 +45,27 @@ pub fn rasterize(
     px_size: f32,
     advance_units: u16,
 ) !Coverage {
-    const scale: f32 = px_size / @as(f32, @floatFromInt(units_per_em));
+    return rasterizeScaled(gpa, outline, units_per_em, px_size, px_size, advance_units);
+}
+
+/// Rasterize `outline` into a box `px_w` by `px_h` pixels, which need not be
+/// square.
+///
+/// A glyph never wants this: a face draws its two axes at one scale, and text
+/// stretched in one axis is a different typeface. An icon does, because a rule
+/// is a straight line and a straight line stretched along itself is the same
+/// line. `rasterize` is this function with the two equal.
+pub fn rasterizeScaled(
+    gpa: std.mem.Allocator,
+    outline: Outline,
+    units_per_em: u16,
+    px_w: f32,
+    px_h: f32,
+    advance_units: u16,
+) !Coverage {
+    const scale: f32 = px_w / @as(f32, @floatFromInt(units_per_em));
+    const scale_y: f32 = px_h / @as(f32, @floatFromInt(units_per_em));
+    // The advance is a horizontal measure, so it follows the horizontal scale.
     const advance: f32 = @as(f32, @floatFromInt(advance_units)) * scale;
 
     // 1. Flatten every segment into device-space line edges. Device space
@@ -60,27 +80,27 @@ pub fn rasterize(
     var any_point = false;
 
     for (outline.contours.items) |contour| {
-        var cur = devPoint(contour.start, scale);
+        var cur = devPoint(contour.start, scale, scale_y);
         const first = cur;
         trackBounds(cur, &min_x, &min_y, &max_x, &max_y, &any_point);
         for (contour.segs.items) |seg| {
             switch (seg) {
                 .line => |p| {
-                    const to = devPoint(p, scale);
+                    const to = devPoint(p, scale, scale_y);
                     try edges.append(gpa, .{ .x0 = cur.x, .y0 = cur.y, .x1 = to.x, .y1 = to.y });
                     trackBounds(to, &min_x, &min_y, &max_x, &max_y, &any_point);
                     cur = to;
                 },
                 .quad => |q| {
-                    const ctrl = devPoint(q.ctrl, scale);
-                    const end = devPoint(q.end, scale);
+                    const ctrl = devPoint(q.ctrl, scale, scale_y);
+                    const end = devPoint(q.end, scale, scale_y);
                     try flattenQuad(gpa, &edges, cur, ctrl, end, &min_x, &min_y, &max_x, &max_y, &any_point, 0);
                     cur = end;
                 },
                 .cubic => |c| {
-                    const c1 = devPoint(c.c1, scale);
-                    const c2 = devPoint(c.c2, scale);
-                    const end = devPoint(c.end, scale);
+                    const c1 = devPoint(c.c1, scale, scale_y);
+                    const c2 = devPoint(c.c2, scale, scale_y);
+                    const end = devPoint(c.end, scale, scale_y);
                     try flattenCubic(gpa, &edges, cur, c1, c2, end, &min_x, &min_y, &max_x, &max_y, &any_point, 0);
                     cur = end;
                 },
@@ -161,9 +181,9 @@ fn zeroCoverage(advance: f32) Coverage {
     };
 }
 
-/// Convert a font-unit point to device space: scale, then flip Y.
-fn devPoint(p: Point, scale: f32) Point {
-    return .{ .x = p.x * scale, .y = -(p.y * scale) };
+/// Convert a font-unit point to device space: scale each axis, then flip Y.
+fn devPoint(p: Point, scale: f32, scale_y: f32) Point {
+    return .{ .x = p.x * scale, .y = -(p.y * scale_y) };
 }
 
 fn trackBounds(p: Point, min_x: *f32, min_y: *f32, max_x: *f32, max_y: *f32, any: *bool) void {
@@ -529,4 +549,53 @@ test "rasterize Neuropol 'A' end-to-end: non-empty, interior near full, AA edges
     try std.testing.expect(max_a >= 240);
     // Anti-aliased edges present.
     try std.testing.expect(has_partial);
+}
+
+test "a non-square box stretches one axis and leaves the other alone" {
+    // A vertical rule: the centreline of `icon/builtin.zig`'s rule_vertical, on
+    // the same 24 unit grid. Stretching it down must make it longer and must
+    // NOT make it wider, because its width comes from the axis the box does
+    // not stretch.
+    const gpa = std.testing.allocator;
+    var square = Outline{};
+    defer square.deinit(gpa);
+    var sb = outline_mod.Builder.init(&square);
+    try sb.moveTo(gpa, 11.15, 0);
+    try sb.lineTo(gpa, 12.85, 0);
+    try sb.lineTo(gpa, 12.85, 24);
+    try sb.lineTo(gpa, 11.15, 24);
+    sb.finish();
+
+    var flat = try rasterizeScaled(gpa, square, 24, 24, 24, 24);
+    defer flat.deinit(gpa);
+    var tall = try rasterizeScaled(gpa, square, 24, 24, 72, 24);
+    defer tall.deinit(gpa);
+
+    try std.testing.expectEqual(flat.w, tall.w);
+    try std.testing.expectEqual(flat.h * 3, tall.h);
+}
+
+test "rasterize is the square case of rasterizeScaled" {
+    // The wrapper must not drift from what it wraps: text goes through it and
+    // a face draws its two axes at one scale.
+    const gpa = std.testing.allocator;
+    var tri = Outline{};
+    defer tri.deinit(gpa);
+    var tb = outline_mod.Builder.init(&tri);
+    try tb.moveTo(gpa, 2, 2);
+    try tb.lineTo(gpa, 20, 4);
+    try tb.lineTo(gpa, 8, 22);
+    tb.finish();
+
+    var a = try rasterize(gpa, tri, 24, 32, 24);
+    defer a.deinit(gpa);
+    var b = try rasterizeScaled(gpa, tri, 24, 32, 32, 24);
+    defer b.deinit(gpa);
+
+    try std.testing.expectEqual(a.w, b.w);
+    try std.testing.expectEqual(a.h, b.h);
+    try std.testing.expectEqual(a.left, b.left);
+    try std.testing.expectEqual(a.top, b.top);
+    try std.testing.expectEqual(a.advance, b.advance);
+    try std.testing.expectEqualSlices(u8, a.pixels, b.pixels);
 }

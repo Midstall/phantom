@@ -203,11 +203,16 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             // the frontend asked for, so the browser does the scaling and one
             // centreline serves every size. That also fixes stroke-width in
             // GRID units: scaling it here as well would square the factor.
+            //
+            // `preserveAspectRatio="none"` lets the two axes scale apart. The
+            // default centres the square grid inside the box and leaves the rest
+            // blank, which for a rule in a tall box draws exactly the short,
+            // gapped mark the box was made non-square to avoid.
             var gbuf: [svg_path.coord_len]u8 = undefined;
             const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
             var sbuf: [svg_path.coord_len]u8 = undefined;
             var abuf: [8]u8 = undefined;
-            const svg_open = try std.fmt.allocPrint(gpa, "<svg viewBox=\"0 0 {s} {s}\" width=\"{d}\" height=\"{d}\" style=\"position:absolute;left:{d}px;top:{d}px\">", .{ grid_s, grid_s, ic.size, ic.size, ic.origin.x - ox, ic.origin.y - oy });
+            const svg_open = try std.fmt.allocPrint(gpa, "<svg viewBox=\"0 0 {s} {s}\" preserveAspectRatio=\"none\" width=\"{d}\" height=\"{d}\" style=\"position:absolute;left:{d}px;top:{d}px\">", .{ grid_s, grid_s, ic.size.width, ic.size.height, ic.origin.x - ox, ic.origin.y - oy });
             defer gpa.free(svg_open);
             try buf.appendSlice(gpa, svg_open);
             // `<title>` is the accessible name of an inline SVG, and the first
@@ -498,7 +503,7 @@ test "renderToString: an icon emits an inline svg whose viewBox is the grid and 
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 40,
+        .size = .{ .width = 40, .height = 40 },
         .color = geom.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
@@ -519,7 +524,7 @@ test "renderToString: an icon is a stroked centreline, not a filled shape" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geom.Color.rgb(0, 0.502, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -546,10 +551,10 @@ test "renderToString: an icon at twice the size reuses one path at a larger widt
     const gpa = std.testing.allocator;
     var small = dl.DisplayList{};
     defer small.deinit(gpa);
-    try small.append(gpa, .{ .icon = .{ .id = .torii, .size = 16, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
+    try small.append(gpa, .{ .icon = .{ .id = .torii, .size = .{ .width = 16, .height = 16 }, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
     var large = dl.DisplayList{};
     defer large.deinit(gpa);
-    try large.append(gpa, .{ .icon = .{ .id = .torii, .size = 32, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
+    try large.append(gpa, .{ .icon = .{ .id = .torii, .size = .{ .width = 32, .height = 32 }, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
 
     const a = try renderToString(gpa, small, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
     defer gpa.free(a);
@@ -572,7 +577,7 @@ test "renderToString: a labelled icon carries an svg title, so it has an accessi
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geom.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
@@ -594,7 +599,7 @@ test "renderToString: a label with markup in it is escaped, not written through"
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geom.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
         .label = "<b>&</b>",
@@ -613,7 +618,7 @@ test "renderToString: an icon with no label emits no title element at all" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geom.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -636,7 +641,7 @@ test "renderToString: an icon inside a scroll region is placed relative to the r
     } });
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geom.Color.rgb(1, 1, 1),
         .origin = .{ .x = 30, .y = 60 },
     } });
@@ -678,4 +683,29 @@ test "renderToString: push_scroll emits overflow:scroll containers and adjusts c
     try std.testing.expect(std.mem.indexOf(u8, html, "left:0px;top:100px") != null);
     // Closing tags for both divs
     try std.testing.expect(std.mem.indexOf(u8, html, "</div></div>") != null);
+}
+
+test "renderToString: a mark in a box that is not square stretches instead of letterboxing" {
+    // An svg keeps its viewBox aspect by default and centres it in the box,
+    // which for a rule in a tall box redraws the short, gapped mark the box was
+    // made tall to avoid. Only preserveAspectRatio="none" lets the two axes
+    // scale apart.
+    const gpa = std.testing.allocator;
+    var list = dl.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .icon = .{
+        .id = .rule_vertical,
+        .size = .{ .width = 16, .height = 48 },
+        .color = geom.Color.rgb(1, 1, 1),
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    defer gpa.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "preserveAspectRatio=\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width=\"16\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "height=\"48\"") != null);
+    // The viewBox stays the authoring grid, so one centreline still serves
+    // every size and the stroke width keeps its grid units.
+    try std.testing.expect(std.mem.indexOf(u8, html, "viewBox=\"0 0 24 24\"") != null);
 }

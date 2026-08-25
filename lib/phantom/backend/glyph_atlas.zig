@@ -36,7 +36,13 @@ pub const Key = struct {
     kind: Kind,
     /// A glyph's font pointer, or an icon's identifier. Opaque to the atlas.
     owner: usize,
+    /// The width the coverage was rasterised at, as bits.
     size_bits: u32,
+    /// The height, as bits. Equal to `size_bits` for a glyph, which draws its
+    /// two axes at one scale. An icon is free to differ: a rule stretched to
+    /// the height of its row is a different bitmap from the square one, and a
+    /// key that carried only the width would hand back whichever came first.
+    height_bits: u32,
     id: u32,
 };
 
@@ -112,6 +118,9 @@ pub fn ensure(
         .kind = .glyph,
         .owner = @intFromPtr(font),
         .size_bits = @bitCast(size),
+        // A face draws its two axes at one scale, so a glyph is always square
+        // in this sense, whatever its bitmap ends up measuring.
+        .height_bits = @bitCast(size),
         .id = cp,
     };
 
@@ -240,8 +249,8 @@ test "GlyphAtlas.ensure packs a glyph and uploads non-zero coverage" {
 test "an icon key and a glyph key with the same numbers do not collide" {
     // Without the kind discriminator, icon 65 at 16px and glyph 'A' at 16px in
     // the font at address 65 would share a cache slot and draw each other.
-    const g = Key{ .kind = .glyph, .owner = 65, .size_bits = @bitCast(@as(f32, 16)), .id = 65 };
-    const i = Key{ .kind = .icon, .owner = 65, .size_bits = @bitCast(@as(f32, 16)), .id = 65 };
+    const g = Key{ .kind = .glyph, .owner = 65, .size_bits = @bitCast(@as(f32, 16)), .height_bits = @bitCast(@as(f32, 16)), .id = 65 };
+    const i = Key{ .kind = .icon, .owner = 65, .size_bits = @bitCast(@as(f32, 16)), .height_bits = @bitCast(@as(f32, 16)), .id = 65 };
     try std.testing.expect(!std.meta.eql(g, i));
 }
 
@@ -252,7 +261,7 @@ test "ensureCoverage returns the cached entry on the second call" {
     var atlas = try GlyphAtlas.init(sel.device, gpa);
     defer atlas.deinit(gpa);
 
-    const key = Key{ .kind = .icon, .owner = 1, .size_bits = @bitCast(@as(f32, 16)), .id = 7 };
+    const key = Key{ .kind = .icon, .owner = 1, .size_bits = @bitCast(@as(f32, 16)), .height_bits = @bitCast(@as(f32, 16)), .id = 7 };
 
     const first_pixels = try gpa.alloc(u8, 4 * 3);
     @memset(first_pixels, 0xff);
@@ -304,7 +313,7 @@ test "ensureCoverage on a zero-size coverage records a degenerate entry" {
     var atlas = try GlyphAtlas.init(sel.device, gpa);
     defer atlas.deinit(gpa);
 
-    const key = Key{ .kind = .icon, .owner = 3, .size_bits = @bitCast(@as(f32, 24)), .id = 11 };
+    const key = Key{ .kind = .icon, .owner = 3, .size_bits = @bitCast(@as(f32, 24)), .height_bits = @bitCast(@as(f32, 24)), .id = 11 };
     const cov = Coverage{
         .pixels = &.{},
         .w = 0,

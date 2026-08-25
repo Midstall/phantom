@@ -278,8 +278,8 @@ fn paintIconFallback(grid: *CellGrid, p: dl.IconPrimitive, ctx: Ctx) void {
     const rect = geom.PhysicalRect{
         .x = p.origin.x,
         .y = p.origin.y,
-        .width = p.size,
-        .height = p.size,
+        .width = p.size.width,
+        .height = p.size.height,
     };
     const b = cellBounds(rect, ctx, grid);
     const color = Rgb.fromColor(p.color);
@@ -1060,7 +1060,7 @@ test "a mark with a character becomes that character, not a block" {
     // One cell, at the origin.
     try list.append(gpa, .{ .icon = .{
         .id = .check,
-        .size = 16,
+        .size = .{ .width = 16, .height = 16 },
         .color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -1085,7 +1085,7 @@ test "a rule fills every cell it covers, so a stacked rail has no gap" {
     // Three cells tall, which is the shape a provenance rail asks for.
     try list.append(gpa, .{ .icon = .{
         .id = .rule_vertical,
-        .size = 48,
+        .size = .{ .width = 48, .height = 48 },
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -1106,7 +1106,7 @@ test "a symbol taller than one cell draws once, not once for every cell" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .check,
-        .size = 48,
+        .size = .{ .width = 48, .height = 48 },
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -1131,7 +1131,7 @@ test "a mark with no character keeps the block it always had" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 16,
+        .size = .{ .width = 16, .height = 16 },
         .color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -1150,11 +1150,38 @@ test "a mark with no coverage draws nothing" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .check,
-        .size = 16,
+        .size = .{ .width = 16, .height = 16 },
         .color = .{ .r = 1, .g = 0, .b = 0, .a = 0 },
         .origin = .{ .x = 0, .y = 0 },
     } });
 
     try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
     try std.testing.expectEqual(@as(u21, ' '), g.cellAt(0, 0).?.ch);
+}
+
+test "a rule filling a tall box stays one column wide" {
+    // The other half of the rail. In pixel mode the box has to be as tall as
+    // the row; in cell mode that same box must still be ONE column, or the rail
+    // tiles sideways and draws a doubled rule on every row.
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 8);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    // One cell across, three rows down: the shape `Icon`'s `.fill` produces.
+    try list.append(gpa, .{ .icon = .{
+        .id = .rule_vertical,
+        .size = .{ .width = 8, .height = 48 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .origin = .{ .x = 0, .y = 0 },
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    for (0..3) |row| {
+        try std.testing.expectEqual(@as(u21, '\u{2502}'), g.cellAt(0, @intCast(row)).?.ch);
+        // Column 1 is the doubling this test exists to catch.
+        try std.testing.expectEqual(@as(u21, ' '), g.cellAt(1, @intCast(row)).?.ch);
+    }
 }

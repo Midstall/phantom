@@ -1,4 +1,4 @@
-//! The Icon widget: draws one built-in mark in a square box.
+//! The Icon widget: draws one built-in mark in a box.
 const std = @import("std");
 const phantom = @import("../../phantom.zig");
 const Widget = phantom.Widget;
@@ -10,12 +10,30 @@ const layout_mod = phantom.layout;
 const theme_mod = @import("../theme.zig");
 const builtin_icons = @import("../icon/builtin.zig");
 
+/// How a mark fills a box that is not square.
+pub const Fit = enum {
+    /// Keep the mark square, at the shorter side of the box, and centre it.
+    /// A mark has shape in both axes, so stretching one distorts it. This is
+    /// the default for that reason.
+    square,
+    /// Stretch the mark to the whole box.
+    ///
+    /// For a rule this is the only correct answer: `rule_vertical` in a box one
+    /// column wide and one row tall must reach the full height of the row, or
+    /// consecutive rows draw a dashed line instead of one continuous rail. A
+    /// straight line stretched along its own length is the same line, so a rule
+    /// loses nothing here, and its width comes from the other axis, which the
+    /// box does not stretch.
+    fill,
+};
+
 const RenderIcon = struct {
     base: RenderObject,
     id: builtin_icons.Id,
     /// Box side in logical units, from the widget config. Physical units come
     /// from the constraint scale at layout.
     size: f32,
+    fit: Fit,
     color: geom.Color,
     /// Borrowed from the widget config, which the app owns for at least as long
     /// as the element. Nothing here copies it.
@@ -31,12 +49,19 @@ const RenderIcon = struct {
         const self: *RenderIcon = @fieldParentPtr("base", base);
         // The box layout settled on, not the side that was asked for: a parent
         // may squeeze an icon, and a mark drawn at the unconstrained size would
-        // then spill outside its own box. The mark is square, so the shorter
-        // side of a stretched box wins.
-        const side = @min(base.size.width, base.size.height);
+        // then spill outside its own box.
+        const box: geom.PhysicalSize = switch (self.fit) {
+            // The shorter side of a stretched box wins, which keeps the mark
+            // square and inside the box in both axes.
+            .square => sq: {
+                const side = @min(base.size.width, base.size.height);
+                break :sq .{ .width = side, .height = side };
+            },
+            .fill => base.size,
+        };
         cv.drawIcon(.{
             .id = self.id,
-            .size = side,
+            .size = box,
             .color = self.color,
             .origin = offset,
             .label = self.label,
@@ -53,12 +78,18 @@ const RenderIcon = struct {
     }
 };
 
-/// One built-in mark, drawn in a square `size` by `size` logical units.
+/// One built-in mark, drawn in a `size` by `size` logical box, or stretched to
+/// whatever box a parent gives it when `fit` says so.
 pub const Icon = struct {
     id: builtin_icons.Id,
     /// Side of the box in logical units. The grid the mark is authored on, so
     /// the default draws it at its intended weight.
     size: f32 = builtin_icons.grid,
+    /// What the mark does with a box that is not square. Layout is unchanged by
+    /// this: an icon still asks for `size` by `size` and takes whatever a parent
+    /// gives it, so a caller reaches `.fill` by putting the icon in a box of the
+    /// shape it wants, a `SizedBox` for one.
+    fit: Fit = .square,
     /// Null takes the theme foreground.
     color: ?geom.Color = null,
     /// What a screen reader announces for this mark. Give one whenever the icon
@@ -97,6 +128,7 @@ pub const Icon = struct {
             },
             .id = self.id,
             .size = self.size,
+            .fit = self.fit,
             .color = self.resolveColor(parent, bctx),
             .label = self.label,
         };
@@ -118,6 +150,7 @@ pub const Icon = struct {
         const ro: *RenderIcon = @fieldParentPtr("base", el.render_object.?);
         ro.id = self.id;
         ro.size = self.size;
+        ro.fit = self.fit;
         ro.color = self.resolveColor(el.parent, bctx);
         ro.label = self.label;
     }
@@ -172,7 +205,7 @@ test "an Icon at scale 2 lays out to twice the physical size" {
     var canvas = phantom.Canvas.init(gpa);
     defer canvas.deinit();
     try el.render_object.?.paint(&canvas, geom.PhysicalOffset.zero);
-    try std.testing.expectEqual(@as(f32, 64), canvas.list.primitives.items[0].icon.size);
+    try std.testing.expectEqual(geom.PhysicalSize{ .width = 64, .height = 64 }, canvas.list.primitives.items[0].icon.size);
 }
 
 test "an Icon with no explicit colour takes the theme foreground" {
@@ -227,7 +260,7 @@ test "an Icon emits exactly one icon primitive" {
     try std.testing.expectEqual(@as(usize, 1), canvas.list.primitives.items.len);
     const prim = canvas.list.primitives.items[0].icon;
     try std.testing.expectEqual(builtin_icons.Id.torii, prim.id);
-    try std.testing.expectEqual(@as(f32, 24), prim.size);
+    try std.testing.expectEqual(geom.PhysicalSize{ .width = 24, .height = 24 }, prim.size);
     try std.testing.expectEqual(geom.Color.rgb(0, 0, 1), prim.color);
     try std.testing.expectEqual(@as(f32, 7), prim.origin.x);
     try std.testing.expectEqual(@as(f32, 11), prim.origin.y);
@@ -311,5 +344,73 @@ test "an Icon squeezed by a tight constraint draws at the box it was given" {
     var canvas = phantom.Canvas.init(gpa);
     defer canvas.deinit();
     try el.render_object.?.paint(&canvas, geom.PhysicalOffset.zero);
-    try std.testing.expectEqual(@as(f32, 16), canvas.list.primitives.items[0].icon.size);
+    try std.testing.expectEqual(geom.PhysicalSize{ .width = 16, .height = 16 }, canvas.list.primitives.items[0].icon.size);
+}
+
+test "a filled Icon takes the whole box, and a square one still does not" {
+    // The rail case: a box one column wide and a whole row tall. `.square`
+    // shrinks the mark to the column width and leaves the rest of the row
+    // blank, which draws a dashed line down a stack of rows.
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = &owner };
+
+    const box = layout_mod.BoxConstraints.tight(.{ .width = 16, .height = 48 });
+
+    var filled = Icon{ .id = .rule_vertical, .size = 24, .fit = .fill };
+    const filled_el = try filled.widget().mount(&bctx, null);
+    defer filled_el.deinit(gpa);
+    _ = filled_el.render_object.?.layout(box);
+
+    var squared = Icon{ .id = .rule_vertical, .size = 24 };
+    const squared_el = try squared.widget().mount(&bctx, null);
+    defer squared_el.deinit(gpa);
+    _ = squared_el.render_object.?.layout(box);
+
+    var canvas = phantom.Canvas.init(gpa);
+    defer canvas.deinit();
+    try filled_el.render_object.?.paint(&canvas, geom.PhysicalOffset.zero);
+    try squared_el.render_object.?.paint(&canvas, geom.PhysicalOffset.zero);
+
+    const f = canvas.list.primitives.items[0].icon.size;
+    try std.testing.expectEqual(@as(f32, 16), f.width);
+    try std.testing.expectEqual(@as(f32, 48), f.height);
+
+    // The default is unchanged: a mark with shape in both axes must not start
+    // stretching because a parent handed down a tall box.
+    const s = canvas.list.primitives.items[1].icon.size;
+    try std.testing.expectEqual(@as(f32, 16), s.width);
+    try std.testing.expectEqual(@as(f32, 16), s.height);
+}
+
+test "fill and square agree when the box is already square" {
+    // The two differ only in what they do with a box that is not square, so a
+    // square box must give the same primitive either way.
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = &owner };
+
+    const box = layout_mod.BoxConstraints.tight(.{ .width = 32, .height = 32 });
+    var canvas = phantom.Canvas.init(gpa);
+    defer canvas.deinit();
+
+    for ([_]Fit{ .fill, .square }) |fit| {
+        var ic = Icon{ .id = .check, .size = 24, .fit = fit };
+        const el = try ic.widget().mount(&bctx, null);
+        defer el.deinit(gpa);
+        _ = el.render_object.?.layout(box);
+        try el.render_object.?.paint(&canvas, geom.PhysicalOffset.zero);
+    }
+    try std.testing.expectEqual(
+        canvas.list.primitives.items[0].icon.size,
+        canvas.list.primitives.items[1].icon.size,
+    );
 }

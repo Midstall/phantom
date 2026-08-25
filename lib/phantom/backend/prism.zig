@@ -416,13 +416,14 @@ pub const PrismBackend = struct {
     /// and rasterizing it on a miss. This lives here rather than in GlyphAtlas
     /// because the atlas must not know what an icon path is: it caches coverage,
     /// whatever produced it.
-    fn ensureIcon(self: *PrismBackend, id: icon_builtin.Id, size: f32) !GlyphAtlas.Entry {
+    fn ensureIcon(self: *PrismBackend, id: icon_builtin.Id, size: geom.PhysicalSize) !GlyphAtlas.Entry {
         const key = GlyphAtlas.Key{
             .kind = .icon,
             // Every built-in mark comes from one table, so the id alone separates
             // them and the owner slot stays free for a later per-theme icon set.
             .owner = 0,
-            .size_bits = @bitCast(size),
+            .size_bits = @bitCast(size.width),
+            .height_bits = @bitCast(size.height),
             .id = @intFromEnum(id),
         };
         // Check before stroking: a cache hit must not pay for the expansion.
@@ -434,7 +435,7 @@ pub const PrismBackend = struct {
         // the rasterizer scales `size` against. Passing it as the advance too
         // makes the entry's advance the box width, which is what an icon
         // occupies in a row of them.
-        var cov = try raster.rasterize(self.gpa, out, icon_builtin.grid_units, size, icon_builtin.grid_units);
+        var cov = try raster.rasterizeScaled(self.gpa, out, icon_builtin.grid_units, size.width, size.height, icon_builtin.grid_units);
         defer cov.deinit(self.gpa);
         return self.atlas.ensureCoverage(self.gpa, key, cov);
     }
@@ -569,11 +570,12 @@ pub const PrismBackend = struct {
                 const entry = try self.ensureIcon(ic.id, ic.size);
                 if (entry.w == 0 or entry.h == 0) continue;
                 // entry.left/top are the bitmap's top-left in device space, where
-                // the icon grid's own top-left is (0, -size): the rasterizer flips
-                // y, so the grid's top edge lands at -size. Adding size back turns
-                // the offset into one measured down from the primitive's origin.
+                // the icon grid's own top-left is (0, -height): the rasterizer
+                // flips y, so the grid's top edge lands at minus the box height.
+                // Adding it back turns the offset into one measured down from the
+                // primitive's origin.
                 const ix: f32 = ic.origin.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x;
-                const iy: f32 = ic.origin.y + ic.size + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
+                const iy: f32 = ic.origin.y + ic.size.height + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
                 const iw: f32 = @floatFromInt(entry.w);
                 const ih: f32 = @floatFromInt(entry.h);
                 const tl = toClip(ix, iy, viewport, self.flip_y);
@@ -917,7 +919,7 @@ test "PrismBackend draws an icon primitive tinted, with the gap between its pill
     // a grid coordinate g lands at 8 + g * 2 across, 8 + (24 - g) * 2 down.
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 48,
+        .size = .{ .width = 48, .height = 48 },
         .color = geom.Color.rgb(1, 0, 0),
         .origin = geom.PhysicalOffset{ .x = 8, .y = 8 },
     } });
@@ -1082,4 +1084,99 @@ test "two images and two rects interleaved stack in list order: the last one cov
     const bottom = (32 * W + 3) * 4;
     try std.testing.expect(px[bottom + 0] > 200);
     try std.testing.expect(px[bottom + 1] < 60 and px[bottom + 2] < 60);
+}
+
+test "a rule stretched to its box inks the full height, where a square one leaves a gap" {
+    // The rail down the edge of a transcript: one mark per row, each as tall as
+    // its row. A square mark in a box one column wide is only as tall as it is
+    // wide, so consecutive rows draw a dashed line with blank between them.
+    const gpa = std.testing.allocator;
+    try requireRaster(gpa);
+    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    defer sel.device.deinit();
+    const dev = sel.device;
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    // A box 16 across and 48 down at (8, 8), so the rule's centreline at grid
+    // x 12 lands 8 pixels in, and a filled rule covers y 8 through 56.
+    const box = geom.PhysicalSize{ .width = 16, .height = 48 };
+    const square = geom.PhysicalSize{ .width = 16, .height = 16 };
+
+    for ([_]struct { size: geom.PhysicalSize, tall: bool }{
+        .{ .size = box, .tall = true },
+        .{ .size = square, .tall = false },
+    }) |case| {
+        var backend = try PrismBackend.init(dev, gpa);
+        defer backend.deinit();
+        const ctx = try dev.createContext();
+        defer ctx.deinit();
+        const target = try dev.createResource(.{ .image = .{ .width = W, .height = H, .format = .rgba8_unorm, .usage = .{ .render_target = true } } });
+        defer dev.destroyResource(target);
+
+        var list = dl.DisplayList{};
+        defer list.deinit(gpa);
+        try list.append(gpa, .{ .icon = .{
+            .id = .rule_vertical,
+            .size = case.size,
+            .color = geom.Color.rgb(1, 0, 0),
+            .origin = geom.PhysicalOffset{ .x = 8, .y = 8 },
+        } });
+        try backend.render(ctx, target, geom.PhysicalSize{ .width = 64, .height = 64 }, list, geom.Color.rgb(0, 0, 0));
+
+        const px = try dev.mapResource(target);
+
+        // Measure the run of inked rows in the column the rule draws in. Where
+        // that run sits is not the point and would only pin this harness's y
+        // flip (see the torii test above); how long it is, and whether it has a
+        // hole in it, is the whole of the bug.
+        var first: ?u32 = null;
+        var last: u32 = 0;
+        var inked: u32 = 0;
+        for (0..H) |yy| {
+            const y: u32 = @intCast(yy);
+            if (px[(y * W + 16) * 4] > 60) {
+                if (first == null) first = y;
+                last = y;
+                inked += 1;
+            }
+        }
+        try std.testing.expect(first != null);
+        const span = last - first.? + 1;
+        // Continuous, with no row skipped between the two ends. A rail is one
+        // line, and a rule that reached its ends through a gap would still draw
+        // the dashes this test is about.
+        try std.testing.expectEqual(span, inked);
+
+        if (case.tall) {
+            // The box is 48 down, and the mark has to cover it.
+            try std.testing.expect(span >= 44);
+        } else {
+            // The square mark is only as tall as the box is wide, which is the
+            // 16 that left 32 rows of the row blank.
+            try std.testing.expect(span <= 20);
+        }
+    }
+}
+
+test "the atlas keeps one mark at two heights apart" {
+    // The key carried only a width once. Two rules of different heights then
+    // shared a slot, and whichever rasterised first was drawn for both, which
+    // is a rail that changes length when a row above it resizes.
+    const gpa = std.testing.allocator;
+    try requireRaster(gpa);
+    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    defer sel.device.deinit();
+    var backend = try PrismBackend.init(sel.device, gpa);
+    defer backend.deinit();
+
+    const short = try backend.ensureIcon(.rule_vertical, .{ .width = 16, .height = 16 });
+    const tall = try backend.ensureIcon(.rule_vertical, .{ .width = 16, .height = 48 });
+    try std.testing.expect(tall.h > short.h);
+    // And a repeat of the first is still the first: the height must separate the
+    // two without breaking the cache for a mark that has not changed.
+    const again = try backend.ensureIcon(.rule_vertical, .{ .width = 16, .height = 16 });
+    try std.testing.expectEqual(short.h, again.h);
+    try std.testing.expectEqual(short.u0, again.u0);
 }

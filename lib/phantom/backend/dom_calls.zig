@@ -199,15 +199,20 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
             const view_box = try std.fmt.allocPrint(gpa, "0 0 {s} {s}", .{ grid_s, grid_s });
             defer gpa.free(view_box);
-            const side = try std.fmt.allocPrint(gpa, "{d}", .{ic.size});
-            defer gpa.free(side);
+            const w_s = try std.fmt.allocPrint(gpa, "{d}", .{ic.size.width});
+            defer gpa.free(w_s);
+            const h_s = try std.fmt.allocPrint(gpa, "{d}", .{ic.size.height});
+            defer gpa.free(h_s);
             const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - ox, ic.origin.y - oy });
             defer gpa.free(style);
 
             const svg = ops.createElementNs(svg_ns, "svg");
             ops.setAttribute(svg, "viewBox", view_box);
-            ops.setAttribute(svg, "width", side);
-            ops.setAttribute(svg, "height", side);
+            // See `dom.zig`: without this the browser centres the square grid in
+            // a box that is not square and the mark comes out short.
+            ops.setAttribute(svg, "preserveAspectRatio", "none");
+            ops.setAttribute(svg, "width", w_s);
+            ops.setAttribute(svg, "height", h_s);
             ops.setAttribute(svg, "style", style);
 
             // `<title>` is the accessible name of an inline SVG, and the first
@@ -558,7 +563,7 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 40,
+        .size = .{ .width = 40, .height = 40 },
         .color = geometry.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
@@ -593,7 +598,7 @@ test "dom_calls: a labelled icon appends a namespaced title node holding the nam
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
@@ -619,7 +624,7 @@ test "dom_calls: an icon with no label creates no title node" {
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
@@ -640,7 +645,7 @@ test "dom_calls: a host with no namespaced creator still builds the icon through
     defer list.deinit(gpa);
     try list.append(gpa, .{ .icon = .{
         .id = .torii,
-        .size = 24,
+        .size = .{ .width = 24, .height = 24 },
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });

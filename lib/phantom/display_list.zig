@@ -73,12 +73,19 @@ pub const ImagePrimitive = struct {
 /// one primitive per icon however many contours the mark has.
 pub const IconPrimitive = struct {
     id: icon_builtin.Id,
-    /// Side of the square the mark draws into, in device pixels. The icon grid
-    /// maps onto this square, so it is a size and not a scale factor.
-    size: f32,
+    /// The box the mark draws into, in device pixels. The icon grid maps onto
+    /// this box, so it is a size and not a scale factor.
+    ///
+    /// A box that is not square scales the two axes by different amounts. That
+    /// is what a rule needs: `rule_vertical` must reach the full height of its
+    /// row while it stays one column wide, and stretching a straight line along
+    /// its own length keeps it straight. A mark with shape in both axes, a tick
+    /// for one, comes out distorted, so a caller asks for this only where it
+    /// means it (see `widgets/icon.zig`'s `Fit`).
+    size: geom.PhysicalSize,
     /// The mark is a single colour: coverage tints this, as a glyph does.
     color: geom.Color,
-    /// Top-left of that square in device pixels.
+    /// Top-left of that box in device pixels.
     origin: geom.PhysicalOffset,
     /// The accessible name of the mark, or null when a neighbouring label
     /// already names it and a second announcement would only repeat. The DOM
@@ -134,7 +141,7 @@ pub fn primitiveEql(a: Primitive, b: Primitive) bool {
         .icon => |x| i: {
             const y = b.icon;
             break :i x.id == y.id and
-                x.size == y.size and
+                std.meta.eql(x.size, y.size) and
                 std.meta.eql(x.color, y.color) and
                 std.meta.eql(x.origin, y.origin) and
                 optionalBytesEql(x.label, y.label);
