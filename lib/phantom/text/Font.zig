@@ -87,6 +87,45 @@ pub fn advance(self: *const Font, cp: u21, px_size: f32) f32 {
     return adv_units * px_size / @as(f32, @floatFromInt(self.metrics.units_per_em));
 }
 
+/// The height of one line of this font at `px_size`, in those same pixels.
+///
+/// Ascent above the baseline plus descent below it. This is the LINE BOX, the
+/// thing a caller needs to know how many rows fit in a height, and it is not the
+/// point size: a 24px font does not occupy 24px of vertical space.
+///
+/// `line_gap` is deliberately left out. The gap is leading BETWEEN lines rather
+/// than part of a line's own box, and `layout.layoutLine` has always measured a
+/// run as ascent minus descent, so including it here would make this disagree
+/// with the only other place phantom computes the same quantity. There is one
+/// definition, and `layoutLine` calls this one.
+///
+/// Public because a caller that fits text to a row of a FIXED height, a terminal
+/// cell being the case that forced this, otherwise has to recompute
+/// `(ascent - descent) * size / units_per_em` from the raw fields, which is
+/// phantom's own internal sum written out a second time in somebody else's code.
+pub fn lineHeight(self: *const Font, px_size: f32) f32 {
+    const units: f32 = @floatFromInt(@as(i32, self.metrics.ascent) - @as(i32, self.metrics.descent));
+    return units * px_size / @as(f32, @floatFromInt(self.metrics.units_per_em));
+}
+
+/// The `px_size` whose line box is exactly `line_px` tall: the inverse of
+/// `lineHeight`.
+///
+/// For fitting text to a row whose height is already decided. The terminal's
+/// pixel mode sizes its default text with this so one line of text occupies one
+/// terminal cell, which is what makes an 80x24 terminal show 24 rows of text
+/// rather than the 13 a fixed point size gave.
+///
+/// Returns 0 for a font whose ascent and descent are equal, which is a font with
+/// no vertical extent at all: there is no size that makes a zero-height line box
+/// reach `line_px`, and 0 is the answer that draws nothing rather than one that
+/// divides by zero.
+pub fn sizeForLineHeight(self: *const Font, line_px: f32) f32 {
+    const units: f32 = @floatFromInt(@as(i32, self.metrics.ascent) - @as(i32, self.metrics.descent));
+    if (units <= 0) return 0;
+    return line_px * @as(f32, @floatFromInt(self.metrics.units_per_em)) / units;
+}
+
 /// Return a rasterized glyph Coverage for codepoint `cp` at `px_size` pixels.
 /// Results are cached; subsequent calls with the same (cp, px_size) return the
 /// same pointer without re-rasterizing.
@@ -228,4 +267,42 @@ test "a bundled font's weight always falls in the valid OS/2 usWeightClass range
     var font = try load(gpa, @import("builtin.zig").neuropol_bytes);
     defer font.deinit(gpa);
     try std.testing.expect(font.weight() >= 100 and font.weight() <= 1000);
+}
+
+test "lineHeight is the ascent-to-descent box, and scales with the size" {
+    const gpa = std.testing.allocator;
+    var f = try @import("builtin.zig").mesmerize_rg(gpa);
+    defer f.deinit(gpa);
+
+    const at16 = f.lineHeight(16);
+    const at32 = f.lineHeight(32);
+    try std.testing.expect(at16 > 0);
+    // Linear in the size, so twice the size is twice the box.
+    try std.testing.expectApproxEqRel(at16 * 2, at32, 0.0001);
+    // And it is NOT the point size: a line box is taller than the em it names,
+    // which is the whole reason a caller cannot use the size as a row height.
+    try std.testing.expect(at16 > 16);
+}
+
+test "sizeForLineHeight inverts lineHeight, so text can be fitted to a fixed row" {
+    const gpa = std.testing.allocator;
+    var f = try @import("builtin.zig").mesmerize_rg(gpa);
+    defer f.deinit(gpa);
+
+    for ([_]f32{ 8, 16, 18, 37, 100 }) |row| {
+        const size = f.sizeForLineHeight(row);
+        try std.testing.expectApproxEqRel(row, f.lineHeight(size), 0.0001);
+    }
+}
+
+test "a run's measured height is the same number lineHeight reports" {
+    const gpa = std.testing.allocator;
+    var f = try @import("builtin.zig").mesmerize_rg(gpa);
+    defer f.deinit(gpa);
+
+    // The two must agree or fitting text to a row would be arithmetic about a
+    // box that layout then ignores.
+    var line = try @import("layout.zig").layoutLine(gpa, &f, "Taps: 0", 24, .proportional);
+    defer line.deinit(gpa);
+    try std.testing.expectApproxEqRel(f.lineHeight(24), line.height, 0.0001);
 }

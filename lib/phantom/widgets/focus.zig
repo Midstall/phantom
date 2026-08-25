@@ -22,6 +22,8 @@ const RenderFocus = struct {
     gpa: std.mem.Allocator,
     child: ?*RenderObject = null,
     handlers: FocusHandlers,
+    /// The copy of the config's id that `handlers.id` points at.
+    id: phantom.focus.OwnedId = .{},
     // User callbacks + ctx captured from the widget config.
     on_key: ?*const fn (*anyopaque, input.KeyEvent) bool,
     on_focus_change: ?*const fn (*anyopaque, bool) void,
@@ -38,6 +40,7 @@ const RenderFocus = struct {
     }
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
         const self: *RenderFocus = @fieldParentPtr("base", base);
+        self.id.deinit(gpa);
         gpa.destroy(self);
     }
     fn adopt(base: *RenderObject, child: ?*RenderObject) void {
@@ -63,20 +66,28 @@ pub const Focus = struct {
     on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
     on_focus_change: ?*const fn (ctx: *anyopaque, focused: bool) void = null,
     ctx: *anyopaque = undefined,
+    /// The name `FocusManager.focusById` moves the focus here by. Null leaves the
+    /// node reachable through Tab only. The text is copied on mount, so a caller may
+    /// build it in the frame arena. Keep it unique inside one tree: the first node
+    /// in tree order answers to a name two nodes share.
+    id: ?[]const u8 = null,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
     pub fn widget(self: *const Focus) Widget {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn install(ro: *RenderFocus, self: *const Focus) void {
+    fn install(ro: *RenderFocus, self: *const Focus) !void {
         ro.on_key = self.on_key;
         ro.on_focus_change = self.on_focus_change;
         ro.user_ctx = self.ctx;
+        try ro.id.set(ro.gpa, self.id);
         ro.handlers = .{
             .ctx = ro,
             .on_key = if (self.on_key != null) RenderFocus.keyThunk else null,
             .on_focus_change = if (self.on_focus_change != null) RenderFocus.focusChangeThunk else null,
+            .id = ro.id.text,
+            .node = &ro.base,
         };
         ro.base.focus = &ro.handlers;
     }
@@ -86,8 +97,12 @@ pub const Focus = struct {
         const gpa = bctx.owner.gpa;
         const ro = try gpa.create(RenderFocus);
         ro.* = .{ .base = .{ .layoutFn = RenderFocus.layoutFn, .paintFn = RenderFocus.paintFn, .destroyFn = RenderFocus.destroyFn, .adoptChildFn = RenderFocus.adopt }, .gpa = gpa, .handlers = .{ .ctx = undefined }, .on_key = null, .on_focus_change = null, .user_ctx = undefined };
-        install(ro, self);
+        install(ro, self) catch |e| {
+            gpa.destroy(ro);
+            return e;
+        };
         const el = gpa.create(Element) catch |e| {
+            ro.id.deinit(gpa);
             gpa.destroy(ro);
             return e;
         };
@@ -100,7 +115,7 @@ pub const Focus = struct {
     fn update(ptr: *const anyopaque, el: *Element, bctx: *BuildContext) anyerror!void {
         const self: *const Focus = @ptrCast(@alignCast(ptr));
         const ro: *RenderFocus = @fieldParentPtr("base", el.render_object.?);
-        install(ro, self);
+        try install(ro, self);
         el.child = try el.updateChild(el.child, self.child, bctx);
         ro.base.adoptChild(if (el.child) |c| c.renderObject() else null);
     }
@@ -169,6 +184,108 @@ test "two Focus widgets collect in the order they appear in the tree" {
     const one = mgr.current.?;
     mgr.focusNext();
     try std.testing.expect(mgr.current != one);
+}
+
+test "an id reaches one named Focus widget and its keys, whatever the Tab order says" {
+    const gpa = std.testing.allocator;
+    const Seen = struct {
+        var first: u32 = 0;
+        var second: u32 = 0;
+        fn onFirst(_: *anyopaque, _: phantom.input.KeyEvent) bool {
+            first += 1;
+            return true;
+        }
+        fn onSecond(_: *anyopaque, _: phantom.input.KeyEvent) bool {
+            second += 1;
+            return true;
+        }
+    };
+    Seen.first = 0;
+    Seen.second = 0;
+
+    var leaf_a = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 0, 0) };
+    var leaf_b = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 1, 0) };
+    var prompt = Focus{ .id = "prompt", .child = leaf_a.widget(), .on_key = Seen.onFirst };
+    var results = Focus{ .id = "results", .child = leaf_b.widget(), .on_key = Seen.onSecond };
+    var children = [_]phantom.Widget{ prompt.widget(), results.widget() };
+    var column = phantom.Column(.{ .children = &children });
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, column.widget());
+    defer h.deinit();
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+
+    // "results" is second in the Tab order, so a click on it cannot be expressed as
+    // a number of Tab presses without the application counting the tree itself.
+    try std.testing.expect(mgr.focusById("results"));
+    _ = mgr.dispatch(.{ .keysym = phantom.input.Keysym.fromCodepoint('x') });
+    try std.testing.expectEqual(@as(u32, 0), Seen.first);
+    try std.testing.expectEqual(@as(u32, 1), Seen.second);
+
+    try std.testing.expect(mgr.focusById("prompt"));
+    _ = mgr.dispatch(.{ .keysym = phantom.input.Keysym.fromCodepoint('x') });
+    try std.testing.expectEqual(@as(u32, 1), Seen.first);
+    try std.testing.expectEqual(@as(u32, 1), Seen.second);
+}
+
+test "a Focus widget copies its id, so an id built for one frame still answers later" {
+    const gpa = std.testing.allocator;
+    var scratch: [16]u8 = undefined;
+    const built = try std.fmt.bufPrint(&scratch, "row-{d}", .{3});
+
+    var leaf = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    var f = Focus{ .id = built, .child = leaf.widget() };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, f.widget());
+    defer h.deinit();
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+
+    // The frame loop resets the arena a config was built in before the next key
+    // arrives. Overwriting the source stands in for that.
+    @memset(&scratch, 'z');
+    try std.testing.expect(mgr.focusById("row-3"));
+    try std.testing.expectEqualStrings("row-3", mgr.focusedId().?);
+}
+
+test "currentNode on a focused Focus widget is that widget's own render object" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    var f = Focus{ .id = "only", .child = leaf.widget() };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, f.widget());
+    defer h.deinit();
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+
+    try std.testing.expect(mgr.focusById("only"));
+    // This is what `ScrollController.showChild` is handed to bring the focused node
+    // into view, so it has to be the node's own render object and not its child's.
+    try std.testing.expect(mgr.currentNode() == h.root.render_object.?);
+}
+
+test "a rebuilt Focus widget answers to its new id and no longer to the old one" {
+    const gpa = std.testing.allocator;
+    var leaf = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    var before = Focus{ .id = "old", .child = leaf.widget() };
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    var h = try testing.mount(gpa, before.widget());
+    defer h.deinit();
+    h.owner.focus = &mgr;
+    try mgr.collect(gpa, h.root);
+    try std.testing.expect(mgr.focusById("old"));
+
+    var bctx = phantom.BuildContext{ .arena = h.arena.allocator(), .owner = h.owner };
+    var after = Focus{ .id = "new", .child = leaf.widget() };
+    try after.widget().update(h.root, &bctx);
+    try mgr.collect(gpa, h.root);
+
+    try std.testing.expect(mgr.focusById("new"));
+    try std.testing.expect(!mgr.focusById("old"));
 }
 
 test "unmounting a focused Focus widget removes it from the manager" {

@@ -15,9 +15,26 @@ pub const find = struct {
     }
 };
 
+/// The first element of `f`'s type, in pre-order.
+///
+/// Both child links are followed. An `Element` holds a single `child` for a
+/// widget that wraps one other, and a `children` list for one that holds many,
+/// and this used to walk only the first: everything under a `Flex`, and so under
+/// every `Column` and `Row`, was invisible to `find.byType`. A test looking
+/// there got `error.FinderMatchedNothing` and read as a widget that was not
+/// built, rather than as a finder that could not see it.
+///
+/// A branch that finds nothing must not end the search either. The single-child
+/// walk returned its own result outright, so a miss down `child` reported a miss
+/// overall even when a later branch held the element.
 fn search(el: *Element, f: Finder) ?*Element {
     if (std.mem.eql(u8, el.type_name, f.type_name)) return el;
-    if (el.child) |c| return search(c, f);
+    if (el.child) |c| {
+        if (search(c, f)) |found| return found;
+    }
+    for (el.children.items) |c| {
+        if (search(c, f)) |found| return found;
+    }
     return null;
 }
 
@@ -104,19 +121,41 @@ pub const Harness = struct {
     sink: *phantom.FaultSink,
     root: *Element,
     canvas: phantom.Canvas,
+    /// Owned by the harness and already wired to `owner.focus`.
+    ///
+    /// The harness owns it because the teardown ORDER matters and getting it
+    /// wrong aborts with no diagnostic: unmounting the tree calls `forget` on
+    /// the manager, so a manager that a test declared after the harness is torn
+    /// down first and `forget` then reads freed storage. Owning it here makes
+    /// the order right by construction. A test that needs the focus manager
+    /// uses this one rather than declaring its own.
+    focus: *phantom.FocusManager,
     dispatcher: phantom.input.Dispatcher = .{},
     viewport: phantom.LogicalSize = .{ .width = 800, .height = 600 },
     dpr: f32 = 1.0,
     strict: bool = false,
 
     pub fn deinit(self: *Harness) void {
+        // The tree first: unmounting it calls back into the focus manager to
+        // forget each render object, so the manager has to still be alive.
         self.root.deinit(self.gpa);
+        self.focus.deinit(self.gpa);
         self.owner.deinit();
         self.canvas.deinit();
         self.arena.deinit();
         self.gpa.destroy(self.arena);
         self.gpa.destroy(self.owner);
         self.gpa.destroy(self.sink);
+        self.gpa.destroy(self.focus);
+    }
+
+    /// Rebuild the focus traversal order from the current tree.
+    ///
+    /// The order is derived from the tree rather than kept incrementally, so it
+    /// has to be rebuilt after anything that adds or removes a focusable node.
+    /// `tui.Session` does this once per frame.
+    pub fn collectFocus(self: *Harness) !void {
+        try self.focus.collect(self.gpa, self.root);
     }
 
     pub fn pump(self: *Harness) !void {
@@ -250,9 +289,12 @@ pub fn mount(gpa: std.mem.Allocator, root_widget: phantom.Widget) !Harness {
     sink.* = .{};
     const owner = try gpa.create(phantom.BuildOwner);
     owner.* = .{ .gpa = gpa, .sink = sink };
+    const focus = try gpa.create(phantom.FocusManager);
+    focus.* = .{};
+    owner.focus = focus;
     var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = owner };
     const root = try root_widget.mount(&bctx, null);
-    return .{ .gpa = gpa, .arena = arena, .owner = owner, .sink = sink, .root = root, .canvas = phantom.Canvas.init(gpa) };
+    return .{ .gpa = gpa, .arena = arena, .owner = owner, .sink = sink, .focus = focus, .root = root, .canvas = phantom.Canvas.init(gpa) };
 }
 
 test "mount + pump the padded blue box, assert tree/layout/html" {
@@ -1268,4 +1310,100 @@ test "Tier 2 terminal: a ColoredBox fills the cells it covers" {
 
     try r.expectBg(0, 0, phantom.Color.rgb(1, 0, 0));
     try r.expectBg(9, 2, phantom.Color.rgb(1, 0, 0));
+}
+
+test "find reaches a widget inside a Column, which the single-child walk could not see" {
+    const gpa = std.testing.allocator;
+    var a = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 0, 0) };
+    var b = phantom.Text{ .text = "inside", .size = 16 };
+    const kids = [_]phantom.Widget{ a.widget(), b.widget() };
+    var col = phantom.Column(.{ .children = &kids });
+
+    var h = try mount(gpa, col.widget());
+    defer h.deinit();
+    try h.pump();
+
+    // Anything under a Flex used to report as absent, so a test asserting on a
+    // widget in a Column was asserting on the finder, not on the tree.
+    try h.expect(find.byType(phantom.Text), .found);
+    try h.expect(find.byType(phantom.ColoredBox), .found);
+}
+
+test "find keeps looking down later branches after an earlier one misses" {
+    const gpa = std.testing.allocator;
+    // The Text sits in the SECOND child. A search that returned the first
+    // branch's answer outright would report it missing.
+    var first = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 1, 0) };
+    var inner = phantom.Text{ .text = "second branch", .size = 16 };
+    var wrapped = phantom.Padding{ .insets = .{}, .child = inner.widget() };
+    const kids = [_]phantom.Widget{ first.widget(), wrapped.widget() };
+    var row = phantom.Row(.{ .children = &kids });
+
+    var h = try mount(gpa, row.widget());
+    defer h.deinit();
+    try h.pump();
+    try h.expect(find.byType(phantom.Text), .found);
+}
+
+test "a widget that is genuinely absent is still reported absent" {
+    const gpa = std.testing.allocator;
+    var only = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    const kids = [_]phantom.Widget{only.widget()};
+    var col = phantom.Column(.{ .children = &kids });
+
+    var h = try mount(gpa, col.widget());
+    defer h.deinit();
+    try h.pump();
+    // Walking more of the tree must not turn a real miss into a false hit.
+    try h.expect(find.byType(phantom.Text), .not_found);
+}
+
+test "the harness tears its focus manager down after the tree, so unmounting can still forget nodes" {
+    const gpa = std.testing.allocator;
+    var inner = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 1, 1) };
+    var f = phantom.Focus{ .id = "only", .child = inner.widget() };
+
+    var h = try mount(gpa, f.widget());
+    try h.pump();
+    try h.collectFocus();
+    // Focused, so the manager holds a pointer into the tree that is about to go.
+    try std.testing.expect(h.focus.focusById("only"));
+
+    // The order is the assertion: a manager torn down first would be read by
+    // `forget` during the unmount below, which aborts with no diagnostic. This
+    // test passing IS the ordering being right.
+    h.deinit();
+}
+
+test "a Button can be focused by the name it was given" {
+    const gpa = std.testing.allocator;
+    var label = phantom.Text{ .text = "Go", .size = 16 };
+    var b = phantom.Button{ .id = "go", .child = label.widget() };
+
+    var h = try mount(gpa, b.widget());
+    defer h.deinit();
+    try h.pump();
+    try h.collectFocus();
+
+    try std.testing.expect(h.focus.focusById("go"));
+    try std.testing.expectEqualStrings("go", h.focus.focusedId().?);
+    // A name nothing answers to must not move the focus.
+    try std.testing.expect(!h.focus.focusById("nope"));
+}
+
+test "a Button with no name is still focusable by traversal, just not by name" {
+    const gpa = std.testing.allocator;
+    var label = phantom.Text{ .text = "Go", .size = 16 };
+    var b = phantom.Button{ .child = label.widget() };
+
+    var h = try mount(gpa, b.widget());
+    defer h.deinit();
+    try h.pump();
+    try h.collectFocus();
+
+    try std.testing.expect(!h.focus.focusById("go"));
+    h.focus.focusNext();
+    // Reached by traversal, and answering to no name.
+    try std.testing.expect(h.focus.currentNode() != null);
+    try std.testing.expect(h.focus.focusedId() == null);
 }

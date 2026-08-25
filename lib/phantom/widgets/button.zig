@@ -33,6 +33,9 @@ const RenderButton = struct {
     hovered: bool = false,
     pressed: bool = false,
     focus_handlers: phantom.FocusHandlers = undefined,
+    /// The copy of the config id that `focus_handlers.id` points at. Owned,
+    /// because the config it comes from lives in the per-frame build arena.
+    id: phantom.focus.OwnedId = .{},
     focused: bool = false,
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
@@ -74,6 +77,7 @@ const RenderButton = struct {
 
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
         const self: *RenderButton = @fieldParentPtr("base", base);
+        self.id.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -158,6 +162,8 @@ const RenderButton = struct {
             .on_key = onKey,
             .on_focus_change = onFocusChange,
             .available = isAvailable,
+            .node = &self.base,
+            .id = self.id.text,
         };
         self.base.focus = &self.focus_handlers;
     }
@@ -170,6 +176,8 @@ pub const Button = struct {
     enabled: bool = true,
     on_tap: ?*const fn (*anyopaque) void = null,
     ctx: *anyopaque = undefined,
+    /// A name the application can move the focus to. See `FocusManager.focusById`.
+    id: ?[]const u8 = null,
     child: Widget,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
@@ -230,8 +238,14 @@ pub const Button = struct {
             .radius = 4,
             .border_width = 0,
         };
+        // Before `colorsFor`, which ends by installing the handlers that read it.
+        ro.id.set(gpa, self.id) catch |e| {
+            gpa.destroy(ro);
+            return e;
+        };
         self.colorsFor(bctx, parent, ro);
         const el = gpa.create(Element) catch |e| {
+            ro.id.deinit(gpa);
             gpa.destroy(ro);
             return e;
         };
@@ -256,6 +270,7 @@ pub const Button = struct {
     fn update(ptr: *const anyopaque, el: *Element, bctx: *BuildContext) anyerror!void {
         const self: *const Button = @ptrCast(@alignCast(ptr));
         const ro: *RenderButton = @fieldParentPtr("base", el.render_object.?);
+        try ro.id.set(ro.gpa, self.id);
         self.colorsFor(bctx, el.parent, ro);
         const pad = bctx.new(phantom.Padding{
             .insets = phantom.LogicalEdgeInsets.symmetric(24, 12),

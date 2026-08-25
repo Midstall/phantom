@@ -79,6 +79,11 @@ const RenderGridView = struct {
     viewport: geom.PhysicalSize = geom.PhysicalSize.zero,
     handlers: pointer.PointerHandlers,
     focus_handlers: phantom.FocusHandlers = undefined,
+    /// The copy of the config id that `focus_handlers.id` points at. Owned,
+    /// because the config it comes from lives in the per-frame build arena.
+    id: phantom.focus.OwnedId = .{},
+    /// The controller this grid is attached to, kept so `destroyFn` can detach.
+    controller: ?*scroll_view.ScrollController = null,
 
     fn reportOom(self: *RenderGridView, msg: []const u8) void {
         if (self.sink) |s| s.report(.oom, msg);
@@ -151,8 +156,36 @@ const RenderGridView = struct {
         try cv.popScroll();
     }
 
+    /// Point the controller at this grid. The same reasoning as `ScrollView`: a
+    /// controller that already drives another view is taken over, because the
+    /// widget that named it here is the live one.
+    fn attach(self: *RenderGridView, controller: ?*scroll_view.ScrollController) void {
+        if (self.controller == controller) return;
+        self.detach();
+        self.controller = controller;
+        if (controller) |c| c.view = .{
+            .node = &self.base,
+            .offset = &self.offset,
+            .content = &self.content,
+            .viewport = &self.viewport,
+        };
+    }
+
+    /// Clear the controller, but only while it still points here. A rebuild that
+    /// moved the controller to another view must not have its new target erased
+    /// by this grid being freed afterwards.
+    fn detach(self: *RenderGridView) void {
+        const c = self.controller orelse return;
+        if (c.view) |v| {
+            if (v.node == &self.base) c.view = null;
+        }
+        self.controller = null;
+    }
+
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
         const self: *RenderGridView = @fieldParentPtr("base", base);
+        self.detach();
+        self.id.deinit(gpa);
         // Frees only the lists (pointers), NOT the child render objects: those are
         // owned by the child Elements and freed by their deinit.
         self.children.deinit(gpa);
@@ -180,7 +213,7 @@ const RenderGridView = struct {
     fn installHandlers(self: *RenderGridView) void {
         self.handlers = .{ .ctx = self, .on_scroll = scrollThunk };
         self.base.pointer = &self.handlers;
-        self.focus_handlers = .{ .ctx = self, .on_key = onKey };
+        self.focus_handlers = .{ .ctx = self, .on_key = onKey, .node = &self.base, .id = self.id.text };
         self.base.focus = &self.focus_handlers;
     }
 };
@@ -195,6 +228,11 @@ pub const GridView = struct {
     /// the space offered, so this is what fixes the height. Zero or less is read
     /// as one, which gives square tiles.
     aspect_ratio: f32 = 1,
+    /// A name the application can move the focus to. See `FocusManager.focusById`.
+    id: ?[]const u8 = null,
+    /// The handle an application scrolls this grid through. `ScrollController`
+    /// drives a `ScrollView` exactly the same way.
+    controller: ?*scroll_view.ScrollController = null,
     children: []const Widget,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
@@ -232,8 +270,16 @@ pub const GridView = struct {
             .aspect_ratio = self.aspect_ratio,
             .handlers = .{ .ctx = rg },
         };
+        // Before `installHandlers`, which reads the id into the focus handlers.
+        rg.id.set(gpa, self.id) catch |e| {
+            gpa.destroy(rg);
+            return e;
+        };
         rg.installHandlers();
+        rg.attach(self.controller);
         const el = gpa.create(Element) catch |e| {
+            rg.detach();
+            rg.id.deinit(gpa);
             gpa.destroy(rg);
             return e;
         };
@@ -257,6 +303,11 @@ pub const GridView = struct {
         rg.columns = self.columns;
         rg.spacing = self.spacing;
         rg.aspect_ratio = self.aspect_ratio;
+        // A rebuild can rename the grid or move the controller to another
+        // widget, so both are re-read and the handlers re-installed.
+        try rg.id.set(bctx.owner.gpa, self.id);
+        rg.installHandlers();
+        rg.attach(self.controller);
         try el.updateChildren(self.children, bctx);
         syncChildren(rg, el, bctx.owner.gpa);
     }
@@ -683,4 +734,65 @@ test "metricsFor divides the width between the columns and the gaps" {
     const guarded = metricsFor(100, 1, 0, 0);
     try std.testing.expectEqual(@as(f32, 100), guarded.item_height);
     try std.testing.expect(std.math.isFinite(metricsFor(100, 1, 0, -3).item_height));
+}
+
+test "a GridView scrolls through the same controller a ScrollView uses" {
+    const gpa = std.testing.allocator;
+    var ctl = scroll_view.ScrollController{};
+    var kids: [12]Widget = undefined;
+    var boxes: [12]phantom.ColoredBox = undefined;
+    for (&boxes, 0..) |*b, i| {
+        b.* = .{ .color = phantom.Color.rgb(@floatFromInt(i % 2), 0, 1) };
+        kids[i] = b.widget();
+    }
+    var g = GridView{ .columns = 2, .controller = &ctl, .children = &kids };
+
+    var h = try testing.mount(gpa, g.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 200, .height = 100 };
+    try h.pump();
+
+    // Attached by mounting, so the application never reaches into the tree.
+    try std.testing.expect(ctl.attached());
+    const max = ctl.maxOffset().?;
+    try std.testing.expect(max.y > 0);
+
+    try std.testing.expect(ctl.scrollBy(0, 30));
+    try std.testing.expectEqual(@as(f32, 30), ctl.offset().?.y);
+    // Clamped to what the content allows, exactly as a wheel event is.
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = max.y + 1000 }));
+    try std.testing.expectEqual(max.y, ctl.offset().?.y);
+}
+
+test "unmounting a GridView detaches its controller, so the app cannot scroll freed storage" {
+    const gpa = std.testing.allocator;
+    var ctl = scroll_view.ScrollController{};
+    var box = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 1, 1) };
+    const kids = [_]Widget{box.widget()};
+    var g = GridView{ .columns = 1, .controller = &ctl, .children = &kids };
+
+    var h = try testing.mount(gpa, g.widget());
+    try h.pump();
+    try std.testing.expect(ctl.attached());
+
+    h.deinit();
+    try std.testing.expect(!ctl.attached());
+    // Every method reports the miss rather than writing through a dead pointer.
+    try std.testing.expect(!ctl.scrollBy(0, 10));
+    try std.testing.expect(ctl.offset() == null);
+}
+
+test "a named GridView takes the focus by that name" {
+    const gpa = std.testing.allocator;
+    var box = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 1, 1) };
+    const kids = [_]Widget{box.widget()};
+    var g = GridView{ .columns = 1, .id = "launcher", .children = &kids };
+
+    var h = try testing.mount(gpa, g.widget());
+    defer h.deinit();
+    try h.pump();
+    try h.collectFocus();
+
+    try std.testing.expect(h.focus.focusById("launcher"));
+    try std.testing.expectEqualStrings("launcher", h.focus.focusedId().?);
 }

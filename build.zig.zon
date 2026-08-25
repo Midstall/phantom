@@ -17,5 +17,11 @@
             .hash = "prism-0.1.0-PSE12AbIOAAMnhpTrIYz4xOe1wphrH0hdEBig6v50waz",
         },
     },
-    .paths = .{ "build", "build.zig", "build.zig.zon", "lib" },
+    .paths = .{
+        "build",
+        "build.zig",
+        "build.zig.zon",
+        "lib",
+        "web",
+    },
 }

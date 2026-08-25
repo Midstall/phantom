@@ -249,6 +249,379 @@ test "forget drops a listener so a later key does not reach freed memory" {
     try std.testing.expect(!m.dispatch(.{ .keysym = input.Keysym.fromCodepoint('q') }));
 }
 
+test "focusNode jumps to a chosen node rather than the next one in the order" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined };
+    var h2 = FocusHandlers{ .ctx = undefined };
+    var h3 = FocusHandlers{ .ctx = undefined };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+    try m.order.append(gpa, &h3);
+    m.focusNext(); // current is h1
+
+    try std.testing.expect(m.focusNode(&h3));
+    try std.testing.expect(m.current == &h3);
+    // The jump must leave the traversal consistent: Tab from h3 wraps to h1.
+    m.focusNext();
+    try std.testing.expect(m.current == &h1);
+}
+
+test "focusNode tells the caller a node outside the order was not focused" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined };
+    var stranger = FocusHandlers{ .ctx = undefined };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    m.focusNext();
+
+    try std.testing.expect(!m.focusNode(&stranger));
+    // An unmounted or unavailable target must not take the focus away from h1.
+    try std.testing.expect(m.current == &h1);
+}
+
+test "focusNode announces the arrival to the node it moved the focus to" {
+    const gpa = std.testing.allocator;
+    const Watch = struct {
+        var gained: bool = false;
+        fn onChange(_: *anyopaque, focused: bool) void {
+            if (focused) gained = true;
+        }
+    };
+    Watch.gained = false;
+    var dummy: u8 = 0;
+    var h1 = FocusHandlers{ .ctx = &dummy };
+    var h2 = FocusHandlers{ .ctx = &dummy, .on_focus_change = Watch.onChange };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+    m.focusNext(); // current is h1
+
+    try std.testing.expect(m.focusNode(&h2));
+    // A button that draws a focus ring only learns it is focused from this call.
+    try std.testing.expect(Watch.gained);
+}
+
+test "focusById reaches a node by name and reports the name back" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined, .id = "prompt" };
+    var h2 = FocusHandlers{ .ctx = undefined, .id = "results" };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+
+    try std.testing.expect(m.focusById("results"));
+    try std.testing.expect(m.current == &h2);
+    try std.testing.expectEqualStrings("results", m.focusedId().?);
+}
+
+test "focusById matches on the id text and not on the slice address" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined, .id = "prompt" };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+
+    // A caller builds the id at runtime, so it is a different slice with the same
+    // bytes. Comparing addresses would silently never match.
+    var built: [6]u8 = "prompt".*;
+    try std.testing.expect(m.focusById(&built));
+    try std.testing.expect(m.current == &h1);
+}
+
+test "focusById leaves the focus where it is when no node carries the id" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined, .id = "prompt" };
+    var h2 = FocusHandlers{ .ctx = undefined };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+    m.focusNext(); // current is h1
+
+    try std.testing.expect(!m.focusById("missing"));
+    try std.testing.expect(m.current == &h1);
+    // A node with no id must not answer to an empty name either.
+    try std.testing.expect(!m.focusById(""));
+    try std.testing.expect(m.current == &h1);
+}
+
+test "focusById takes the first of two nodes that share an id" {
+    const gpa = std.testing.allocator;
+    var h1 = FocusHandlers{ .ctx = undefined, .id = "row" };
+    var h2 = FocusHandlers{ .ctx = undefined, .id = "row" };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+
+    try std.testing.expect(m.focusById("row"));
+    try std.testing.expect(m.current == &h1);
+}
+
+test "currentNode hands back the render object under the focused node" {
+    const gpa = std.testing.allocator;
+    var ro = RenderObject{ .layoutFn = noLayout, .paintFn = noPaint };
+    var h1 = FocusHandlers{ .ctx = undefined, .node = &ro };
+    var h2 = FocusHandlers{ .ctx = undefined };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+    try m.order.append(gpa, &h1);
+    try m.order.append(gpa, &h2);
+
+    try std.testing.expect(m.currentNode() == null); // nothing focused yet
+    m.focusNext();
+    try std.testing.expect(m.currentNode() == &ro);
+    m.focusNext(); // h2 supplied no render object
+    try std.testing.expect(m.currentNode() == null);
+}
+
+test "collect names the nearest focusable ancestor of every node" {
+    const gpa = std.testing.allocator;
+    var outer = FocusHandlers{ .ctx = undefined };
+    var inner = FocusHandlers{ .ctx = undefined };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    // testTree chains the elements, so outer encloses inner.
+    var tree = try testTree(gpa, &.{ &outer, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+
+    try std.testing.expect(outer.parent == null);
+    try std.testing.expect(inner.parent == &outer);
+}
+
+test "collect skips an unavailable node when it names an ancestor" {
+    const gpa = std.testing.allocator;
+    const Gone = struct {
+        fn no(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var dummy: u8 = 0;
+    var outer = FocusHandlers{ .ctx = &dummy };
+    var middle = FocusHandlers{ .ctx = &dummy, .available = Gone.no };
+    var inner = FocusHandlers{ .ctx = &dummy };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &outer, &middle, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+
+    // A disabled node is not in the order, so a key must not bubble into it. The
+    // link has to skip past it to the nearest node the manager still holds.
+    try std.testing.expectEqual(@as(usize, 2), m.order.items.len);
+    try std.testing.expect(inner.parent == &outer);
+}
+
+test "a key the focused node refuses reaches its focusable ancestor" {
+    const gpa = std.testing.allocator;
+    const Ancestor = struct {
+        var saw: ?input.Keysym = null;
+        fn onKey(_: *anyopaque, ev: input.KeyEvent) bool {
+            saw = ev.keysym;
+            return true;
+        }
+    };
+    const Picky = struct {
+        fn onKey(_: *anyopaque, _: input.KeyEvent) bool {
+            return false;
+        }
+    };
+    Ancestor.saw = null;
+    var dummy: u8 = 0;
+    var outer = FocusHandlers{ .ctx = &dummy, .on_key = Ancestor.onKey };
+    var inner = FocusHandlers{ .ctx = &dummy, .on_key = Picky.onKey };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &outer, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+    try std.testing.expect(m.focusNode(&inner));
+
+    // This is a text field inside a scroll view: the field ignores Page Down and
+    // the view around it scrolls.
+    try std.testing.expect(m.dispatch(.{ .keysym = .page_down }));
+    try std.testing.expectEqual(@as(?input.Keysym, .page_down), Ancestor.saw);
+    // Bubbling must not move the focus.
+    try std.testing.expect(m.current == &inner);
+}
+
+test "a key the focused node uses never reaches its ancestor" {
+    const gpa = std.testing.allocator;
+    const Ancestor = struct {
+        var fired = false;
+        fn onKey(_: *anyopaque, _: input.KeyEvent) bool {
+            fired = true;
+            return true;
+        }
+    };
+    const Greedy = struct {
+        fn onKey(_: *anyopaque, _: input.KeyEvent) bool {
+            return true;
+        }
+    };
+    Ancestor.fired = false;
+    var dummy: u8 = 0;
+    var outer = FocusHandlers{ .ctx = &dummy, .on_key = Ancestor.onKey };
+    var inner = FocusHandlers{ .ctx = &dummy, .on_key = Greedy.onKey };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &outer, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+    try std.testing.expect(m.focusNode(&inner));
+
+    try std.testing.expect(m.dispatch(.{ .keysym = .page_down }));
+    try std.testing.expect(!Ancestor.fired);
+}
+
+test "Tab traverses instead of bubbling, so an ancestor cannot trap the user" {
+    const gpa = std.testing.allocator;
+    const Ancestor = struct {
+        var fired = false;
+        fn onKey(_: *anyopaque, _: input.KeyEvent) bool {
+            fired = true;
+            return true; // would swallow every key it is offered
+        }
+    };
+    Ancestor.fired = false;
+    var dummy: u8 = 0;
+    var outer = FocusHandlers{ .ctx = &dummy, .on_key = Ancestor.onKey };
+    var inner = FocusHandlers{ .ctx = &dummy };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &outer, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+    try std.testing.expect(m.focusNode(&inner));
+
+    try std.testing.expect(m.dispatch(.{ .keysym = .tab }));
+    try std.testing.expect(!Ancestor.fired);
+    // Tab wrapped from the last node back to the first.
+    try std.testing.expect(m.current == &outer);
+}
+
+test "bubbling stops at the first ancestor that uses the key" {
+    const gpa = std.testing.allocator;
+    const Log = struct {
+        var order: [3]u8 = .{ 0, 0, 0 };
+        var next: usize = 0;
+        fn record(tag: u8, use: bool) bool {
+            order[next] = tag;
+            next += 1;
+            return use;
+        }
+        fn top(_: *anyopaque, _: input.KeyEvent) bool {
+            return record('t', true);
+        }
+        fn middle(_: *anyopaque, _: input.KeyEvent) bool {
+            return record('m', true);
+        }
+        fn leaf(_: *anyopaque, _: input.KeyEvent) bool {
+            return record('l', false);
+        }
+    };
+    Log.next = 0;
+    Log.order = .{ 0, 0, 0 };
+    var dummy: u8 = 0;
+    var top = FocusHandlers{ .ctx = &dummy, .on_key = Log.top };
+    var middle = FocusHandlers{ .ctx = &dummy, .on_key = Log.middle };
+    var leaf = FocusHandlers{ .ctx = &dummy, .on_key = Log.leaf };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &top, &middle, &leaf });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+    try std.testing.expect(m.focusNode(&leaf));
+
+    try std.testing.expect(m.dispatch(.{ .keysym = .page_down }));
+    // Innermost first, and the outermost ancestor never runs.
+    try std.testing.expectEqual(@as(usize, 2), Log.next);
+    try std.testing.expectEqual(@as(u8, 'l'), Log.order[0]);
+    try std.testing.expectEqual(@as(u8, 'm'), Log.order[1]);
+}
+
+test "forget cuts the parent link so a key cannot bubble into a freed ancestor" {
+    const gpa = std.testing.allocator;
+    const Ancestor = struct {
+        var fired = false;
+        fn onKey(_: *anyopaque, _: input.KeyEvent) bool {
+            fired = true;
+            return true;
+        }
+    };
+    Ancestor.fired = false;
+    var dummy: u8 = 0;
+    var outer = FocusHandlers{ .ctx = &dummy, .on_key = Ancestor.onKey };
+    var inner = FocusHandlers{ .ctx = &dummy };
+    var m = FocusManager{};
+    defer m.deinit(gpa);
+
+    var tree = try testTree(gpa, &.{ &outer, &inner });
+    defer tree.deinit(gpa);
+    try m.collect(gpa, tree.root);
+    try std.testing.expect(m.focusNode(&inner));
+
+    // Element.deinit calls this just before the ancestor's render object is freed.
+    m.forget(&outer);
+    try std.testing.expect(inner.parent == null);
+    try std.testing.expect(!m.dispatch(.{ .keysym = .page_down }));
+    try std.testing.expect(!Ancestor.fired);
+}
+
+test "OwnedId keeps its own copy, so the caller's buffer can be reused" {
+    const gpa = std.testing.allocator;
+    var id = OwnedId{};
+    defer id.deinit(gpa);
+
+    var scratch: [6]u8 = "prompt".*;
+    try id.set(gpa, &scratch);
+    // A frame loop resets the arena a widget config was built in. Overwriting the
+    // source stands in for that.
+    @memset(&scratch, 'z');
+    try std.testing.expectEqualStrings("prompt", id.text.?);
+}
+
+test "OwnedId reuses the copy when the id text has not changed" {
+    const gpa = std.testing.allocator;
+    var id = OwnedId{};
+    defer id.deinit(gpa);
+
+    try id.set(gpa, "prompt");
+    const first = id.text.?.ptr;
+    var same: [6]u8 = "prompt".*;
+    try id.set(gpa, &same);
+    // A settled tree rebuilds every frame, so an allocation per frame per node is
+    // the difference between quiet and churning.
+    try std.testing.expect(id.text.?.ptr == first);
+
+    try id.set(gpa, "results");
+    try std.testing.expect(id.text.?.ptr != first);
+    try std.testing.expectEqualStrings("results", id.text.?);
+}
+
+test "OwnedId releases the copy when the id is taken away" {
+    const gpa = std.testing.allocator;
+    var id = OwnedId{};
+    defer id.deinit(gpa);
+
+    try id.set(gpa, "prompt");
+    try id.set(gpa, null);
+    // The allocator in this test reports a leak if the copy survived.
+    try std.testing.expect(id.text == null);
+}
+
 // Keyboard focus. The pointer path installs `PointerHandlers` on a render object and
 // hit tests the tree to find them. Focus is the same shape with a list instead of a
 // hit test: the order is the pre-order walk of the element tree, which is the order
@@ -265,8 +638,9 @@ const RenderObject = render_object.RenderObject;
 /// `PointerHandlers` carries one.
 pub const FocusHandlers = struct {
     ctx: *anyopaque,
-    /// Returns true when the key was used. An unused key travels no further, because
-    /// there is no bubbling in this slice.
+    /// Returns true when the key was used. A key this handler refuses continues
+    /// through the rest of `dispatch`, which ends at the focusable ancestors and the
+    /// shortcut listeners.
     on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
     on_focus_change: ?*const fn (ctx: *anyopaque, focused: bool) void = null,
     /// Returns false when this handler is temporarily unavailable, for example a
@@ -276,6 +650,50 @@ pub const FocusHandlers = struct {
     /// bookkeeping: the next collect just sees the new answer. Shared by `order` and
     /// `listeners`, so a future disabled `TextField` uses the same field.
     available: ?*const fn (ctx: *anyopaque) bool = null,
+    /// The name an application moves the focus to this node by. Null leaves the node
+    /// reachable through Tab only. The slice must stay valid for as long as the
+    /// handlers do, so a widget that takes an id from its config keeps a copy of it
+    /// in `OwnedId`: a config is rebuilt from a scratch arena that the frame loop
+    /// resets before the next key arrives.
+    id: ?[]const u8 = null,
+    /// The render object these handlers sit on. It turns the focused node into a
+    /// rectangle, which is what `ScrollController.showChild` needs to bring the node
+    /// into view. Null when the installing widget did not supply it.
+    node: ?*RenderObject = null,
+    /// The nearest focusable ancestor. Filled in by `collect` from the element tree,
+    /// so a widget must never set it: an install that did would be overwritten by
+    /// the next collect anyway. `dispatch` walks this chain to offer a refused key
+    /// to what encloses the focused node.
+    parent: ?*FocusHandlers = null,
+};
+
+/// A focus id that a render object owns. A widget config is rebuilt every frame,
+/// usually into a scratch arena that the frame loop resets, so handlers that
+/// borrowed the config's slice would read freed memory on the next key. The copy is
+/// replaced only when the id text changes, which leaves a settled tree allocating
+/// nothing per frame.
+pub const OwnedId = struct {
+    text: ?[]const u8 = null,
+
+    pub fn set(self: *OwnedId, gpa: std.mem.Allocator, id: ?[]const u8) !void {
+        const want = id orelse {
+            self.deinit(gpa);
+            return;
+        };
+        if (self.text) |have| {
+            if (std.mem.eql(u8, have, want)) return;
+        }
+        // Copy before releasing the old text, so a failed allocation leaves the
+        // node with the id it already answered to instead of no id at all.
+        const copy = try gpa.dupe(u8, want);
+        self.deinit(gpa);
+        self.text = copy;
+    }
+
+    pub fn deinit(self: *OwnedId, gpa: std.mem.Allocator) void {
+        if (self.text) |t| gpa.free(t);
+        self.text = null;
+    }
 };
 
 pub const FocusManager = struct {
@@ -298,7 +716,7 @@ pub const FocusManager = struct {
     pub fn collect(self: *FocusManager, gpa: std.mem.Allocator, root: *Element) !void {
         self.order.clearRetainingCapacity();
         self.listeners.clearRetainingCapacity();
-        try walk(gpa, root, &self.order, &self.listeners);
+        try walk(gpa, root, &self.order, &self.listeners, null);
         // The focused node may have been removed from the tree, or turned itself
         // unavailable, by the rebuild that preceded this. Either way it is gone from
         // `order` now. The render object is still alive here (an unmount instead goes
@@ -315,13 +733,30 @@ pub const FocusManager = struct {
         }
     }
 
-    fn walk(gpa: std.mem.Allocator, el: *Element, out: *std.ArrayList(*FocusHandlers), listeners: *std.ArrayList(*FocusHandlers)) !void {
+    /// `enclosing` is the nearest focusable ancestor found so far. Only a node that
+    /// reaches `out` becomes an ancestor for the subtree below it, so every parent
+    /// link points at a node the manager still holds, and `forget` has one list to
+    /// clear a freed node out of.
+    fn walk(
+        gpa: std.mem.Allocator,
+        el: *Element,
+        out: *std.ArrayList(*FocusHandlers),
+        listeners: *std.ArrayList(*FocusHandlers),
+        enclosing: ?*FocusHandlers,
+    ) !void {
+        var inner = enclosing;
         if (el.render_object) |ro| {
-            if (ro.focus) |h| if (isAvailable(h)) try out.append(gpa, h);
+            if (ro.focus) |h| {
+                if (isAvailable(h)) {
+                    h.parent = enclosing;
+                    try out.append(gpa, h);
+                    inner = h;
+                }
+            }
             if (ro.key_listener) |h| if (isAvailable(h)) try listeners.append(gpa, h);
         }
-        if (el.child) |c| try walk(gpa, c, out, listeners);
-        for (el.children.items) |c| try walk(gpa, c, out, listeners);
+        if (el.child) |c| try walk(gpa, c, out, listeners, inner);
+        for (el.children.items) |c| try walk(gpa, c, out, listeners, inner);
     }
 
     fn isAvailable(h: *FocusHandlers) bool {
@@ -368,12 +803,86 @@ pub const FocusManager = struct {
         self.setCurrent(null);
     }
 
-    /// Route one key. The focused node sees it first, because an application must be
-    /// able to take a key the manager would otherwise spend: a text field needs Tab
-    /// to insert a tab, and a dialog needs Escape to close itself. A key the focused
-    /// node does not use reaches the traversal rules (Tab, Escape), and a key the
-    /// traversal rules decline reaches the shortcut listeners last: a `KeyboardListener`
-    /// never steals a key the focused node or a traversal rule wanted first.
+    /// Move the focus to one chosen node. Returns false when the node is not in the
+    /// traversal order, which is how an unmounted or unavailable node looks from
+    /// here, and leaves the focus where it was. Tab order position is the wrong way
+    /// to name a target, so this is what a click on a text field and a "focus the
+    /// search box" command both go through.
+    pub fn focusNode(self: *FocusManager, h: *FocusHandlers) bool {
+        if (self.indexOf(h) == null) return false;
+        self.setCurrent(h);
+        return true;
+    }
+
+    /// Move the focus to the node that carries `id`. Returns false when no available
+    /// node carries it. An id an application repeats is a programmer error the
+    /// manager cannot see, so the first match in tree order wins rather than the
+    /// call failing: focusing the first of two search boxes is still better than
+    /// focusing neither.
+    pub fn focusById(self: *FocusManager, id: []const u8) bool {
+        for (self.order.items) |h| {
+            const have = h.id orelse continue;
+            if (std.mem.eql(u8, have, id)) {
+                self.setCurrent(h);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The id of the focused node. Null when nothing holds the focus or the node
+    /// that does was given no id.
+    pub fn focusedId(self: *const FocusManager) ?[]const u8 {
+        const c = self.current orelse return null;
+        return c.id;
+    }
+
+    /// The render object under the focused node, for a caller that needs its
+    /// rectangle. Null when nothing holds the focus or the installing widget
+    /// supplied no render object.
+    pub fn currentNode(self: *const FocusManager) ?*RenderObject {
+        const c = self.current orelse return null;
+        return c.node;
+    }
+
+    /// Offer `ev` to each focusable ancestor of the focused node, innermost first.
+    /// Returns true when one of them used it.
+    ///
+    /// The chain is bounded by the length of the traversal order, because `collect`
+    /// only ever names an ancestor that is in that order and no node is its own
+    /// ancestor. The bound costs one comparison and removes any chance that a
+    /// corrupted link spins the key loop forever.
+    fn bubble(self: *FocusManager, ev: input.KeyEvent) bool {
+        const c = self.current orelse return false;
+        var next = c.parent;
+        var hops: usize = 0;
+        while (next) |anc| : (next = anc.parent) {
+            if (hops >= self.order.items.len) return false;
+            hops += 1;
+            if (anc.on_key) |f| {
+                if (f(anc.ctx, ev)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Route one key, in four stages, and return true when a stage used it.
+    ///
+    ///   1. The focused node, because an application must be able to take a key the
+    ///      manager would otherwise spend: a text field needs Tab to insert a tab,
+    ///      and a dialog needs Escape to close itself.
+    ///   2. The traversal rules, Tab and Escape.
+    ///   3. The focusable ancestors of the focused node, innermost first. A key the
+    ///      focused node refused usually belongs to what encloses it: the page keys
+    ///      inside a text field belong to the scroll view around it, which is
+    ///      otherwise unreachable while the field holds the focus.
+    ///   4. The shortcut listeners, in tree order.
+    ///
+    /// The ancestors come after the traversal rules and not before, so that no
+    /// ancestor can take Tab away from a user who is trying to leave. The cost is
+    /// that an ancestor cannot define its own meaning for Tab or Escape. Escape is
+    /// still swallowed by rule 2 whenever a node holds the focus, so an ancestor and
+    /// a listener only see Escape when nothing is focused.
     ///
     /// Returns true when the key was used.
     pub fn dispatch(self: *FocusManager, ev: input.KeyEvent) bool {
@@ -404,6 +913,8 @@ pub const FocusManager = struct {
             else => {},
         }
 
+        if (self.bubble(ev)) return true;
+
         // Last: the shortcut listeners, in tree order. The first one that uses the
         // key ends the walk.
         for (self.listeners.items) |l| {
@@ -423,6 +934,12 @@ pub const FocusManager = struct {
         if (self.current == h) self.current = null;
         removeAll(&self.order, h);
         removeAll(&self.listeners, h);
+        // A child of `h` outlives it whenever a subtree is rebuilt from the middle,
+        // so the parent links have to be cut here as well. Without this the next key
+        // would bubble from the surviving child into the freed ancestor.
+        for (self.order.items) |item| {
+            if (item.parent == h) item.parent = null;
+        }
     }
 
     /// Remove every occurrence of `h` from `list`. In practice `h` lives in only one
