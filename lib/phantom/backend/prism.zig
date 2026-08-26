@@ -440,6 +440,41 @@ pub const PrismBackend = struct {
         return self.atlas.ensureCoverage(self.gpa, key, cov);
     }
 
+    /// Append the two triangles that draw one atlas bitmap, with its top-left at
+    /// `x`, `y` in device pixels and tinted by `color`.
+    ///
+    /// A glyph, an icon and a mark standing in for a missing glyph are the same
+    /// thing here: coverage in one atlas, one pipeline, one tint by vertex
+    /// colour. The caller works out where the bitmap goes, which is the only
+    /// part that differs between them.
+    fn appendCoverageQuad(
+        self: *PrismBackend,
+        batch: *Batcher,
+        entry: GlyphAtlas.Entry,
+        x: f32,
+        y: f32,
+        color: geom.Color,
+        viewport: geom.PhysicalSize,
+    ) !void {
+        const w: f32 = @floatFromInt(entry.w);
+        const h: f32 = @floatFromInt(entry.h);
+        const tl = toClip(x, y, viewport, self.flip_y);
+        const tr = toClip(x + w, y, viewport, self.flip_y);
+        const br = toClip(x + w, y + h, viewport, self.flip_y);
+        const bl = toClip(x, y + h, viewport, self.flip_y);
+        const cr = color.r;
+        const cg = color.g;
+        const cb = color.b;
+        const ca = color.a;
+        // Two triangles (CCW): TL-TR-BR, TL-BR-BL.
+        try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb, .a = ca });
+        try batch.tverts.append(self.gpa, .{ .x = tr[0], .y = tr[1], .u = entry.u1, .v = entry.v0, .r = cr, .g = cg, .b = cb, .a = ca });
+        try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb, .a = ca });
+        try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb, .a = ca });
+        try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb, .a = ca });
+        try batch.tverts.append(self.gpa, .{ .x = bl[0], .y = bl[1], .u = entry.u0, .v = entry.v1, .r = cr, .g = cg, .b = cb, .a = ca });
+    }
+
     /// Rasterize `list` into `target`. The list is walked ONCE and the draws are
     /// emitted in list order, so a primitive covers everything before it and nothing
     /// after it. Consecutive primitives of one kind still share a single draw.
@@ -528,6 +563,44 @@ pub const PrismBackend = struct {
                 // Cast the type-erased font pointer back to the concrete type.
                 const font: *text.Font = @ptrCast(@alignCast(run.font));
                 for (run.glyphs) |g| {
+                    // A face with no glyph for this codepoint draws `.notdef`,
+                    // which is a replacement box. The bundled faces are display
+                    // faces and cover little outside ASCII, so an interface that
+                    // writes a tick or a chevron in ordinary text gets boxes here
+                    // while a terminal, drawing with its own font, gets the real
+                    // character. Standing a built-in mark in its place closes
+                    // that split: the two backends show the same thing, and the
+                    // caller writes the character it means.
+                    //
+                    // The mark goes in a square box the size of the text, resting
+                    // on the baseline. Every built-in is drawn inside a margin on
+                    // a centred grid, so that lands a tick at about cap height
+                    // and the midline dots of an ellipsis at about half of it,
+                    // which is where each belongs beside text. Layout already
+                    // reserved this codepoint's advance, so the mark drops into
+                    // the space the box would have taken and nothing shifts.
+                    if (!font.hasGlyph(g.cp)) {
+                        if (icon_builtin.iconForCodepoint(g.cp)) |id| {
+                            const side = run.size;
+                            const entry = try self.ensureIcon(id, .{ .width = side, .height = side });
+                            if (entry.w == 0 or entry.h == 0) continue;
+                            const baseline = run.origin.y + run.ascent + g.y;
+                            // The icon arm below places a bitmap at
+                            // `box_top + box_height + entry.top`. With the box
+                            // bottom on the baseline that is
+                            // `(baseline - side) + side + entry.top`, so the
+                            // side cancels and the baseline carries it.
+                            try self.appendCoverageQuad(
+                                &batch,
+                                entry,
+                                run.origin.x + g.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x,
+                                baseline + @as(f32, @floatFromInt(entry.top)) - cur_off.y,
+                                run.color,
+                                viewport,
+                            );
+                            continue;
+                        }
+                    }
                     const entry = try self.atlas.ensure(self.gpa, font, run.size, g.cp);
                     // Skip zero-size glyphs (whitespace, missing).
                     if (entry.w == 0 or entry.h == 0) continue;
@@ -541,24 +614,7 @@ pub const PrismBackend = struct {
                     // origin.y + ascent (origin is the run's top-left).
                     const gx: f32 = run.origin.x + g.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x;
                     const gy: f32 = run.origin.y + run.ascent + g.y + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
-                    const gw: f32 = @floatFromInt(entry.w);
-                    const gh: f32 = @floatFromInt(entry.h);
-                    // Four corners in clip space, paired with atlas UVs.
-                    const tl = toClip(gx, gy, viewport, self.flip_y);
-                    const tr = toClip(gx + gw, gy, viewport, self.flip_y);
-                    const br = toClip(gx + gw, gy + gh, viewport, self.flip_y);
-                    const bl = toClip(gx, gy + gh, viewport, self.flip_y);
-                    const cr = run.color.r;
-                    const cg = run.color.g;
-                    const cb_c = run.color.b;
-                    const ca = run.color.a;
-                    // Two triangles (CCW): TL-TR-BR, TL-BR-BL.
-                    try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                    try batch.tverts.append(self.gpa, .{ .x = tr[0], .y = tr[1], .u = entry.u1, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                    try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                    try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                    try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                    try batch.tverts.append(self.gpa, .{ .x = bl[0], .y = bl[1], .u = entry.u0, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
+                    try self.appendCoverageQuad(&batch, entry, gx, gy, run.color, viewport);
                 }
             },
             .icon => |ic| {
@@ -576,23 +632,7 @@ pub const PrismBackend = struct {
                 // primitive's origin.
                 const ix: f32 = ic.origin.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x;
                 const iy: f32 = ic.origin.y + ic.size.height + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
-                const iw: f32 = @floatFromInt(entry.w);
-                const ih: f32 = @floatFromInt(entry.h);
-                const tl = toClip(ix, iy, viewport, self.flip_y);
-                const tr = toClip(ix + iw, iy, viewport, self.flip_y);
-                const br = toClip(ix + iw, iy + ih, viewport, self.flip_y);
-                const bl = toClip(ix, iy + ih, viewport, self.flip_y);
-                const cr = ic.color.r;
-                const cg = ic.color.g;
-                const cb_c = ic.color.b;
-                const ca = ic.color.a;
-                // Two triangles (CCW): TL-TR-BR, TL-BR-BL, as the glyph path above.
-                try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                try batch.tverts.append(self.gpa, .{ .x = tr[0], .y = tr[1], .u = entry.u1, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                try batch.tverts.append(self.gpa, .{ .x = tl[0], .y = tl[1], .u = entry.u0, .v = entry.v0, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                try batch.tverts.append(self.gpa, .{ .x = br[0], .y = br[1], .u = entry.u1, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
-                try batch.tverts.append(self.gpa, .{ .x = bl[0], .y = bl[1], .u = entry.u0, .v = entry.v1, .r = cr, .g = cg, .b = cb_c, .a = ca });
+                try self.appendCoverageQuad(&batch, entry, ix, iy, ic.color, viewport);
             },
         };
         try batch.flush();
@@ -1179,4 +1219,88 @@ test "the atlas keeps one mark at two heights apart" {
     const again = try backend.ensureIcon(.rule_vertical, .{ .width = 16, .height = 16 });
     try std.testing.expectEqual(short.h, again.h);
     try std.testing.expectEqual(short.u0, again.u0);
+}
+
+/// Render one codepoint as a text run and give back the target's pixels, for the
+/// fallback tests below. The caller frees the returned slice.
+fn renderOneCodepoint(gpa: std.mem.Allocator, dev: prism.Device, font: *text.Font, cp: u21) ![]u8 {
+    var backend = try PrismBackend.init(dev, gpa);
+    defer backend.deinit();
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const target = try dev.createResource(.{ .image = .{ .width = W, .height = H, .format = .rgba8_unorm, .usage = .{ .render_target = true } } });
+    defer dev.destroyResource(target);
+    const ctx = try dev.createContext();
+    defer ctx.deinit();
+
+    var list = dl.DisplayList{};
+    defer list.deinit(gpa);
+    const glyphs = [_]dl.PositionedGlyph{.{ .cp = cp, .x = 0, .y = 0 }};
+    try list.append(gpa, .{ .text = .{
+        .glyphs = &glyphs,
+        .text = "",
+        .font = font,
+        .size = 32,
+        .color = geom.Color.rgb(1, 1, 1),
+        .origin = geom.PhysicalOffset{ .x = 8, .y = 8 },
+        .ascent = 40,
+    } });
+    try backend.render(ctx, target, geom.PhysicalSize{ .width = 64, .height = 64 }, list, geom.Color.rgb(0, 0, 0));
+    return gpa.dupe(u8, try dev.mapResource(target));
+}
+
+test "a codepoint the face cannot draw becomes its built-in mark" {
+    // The bundled faces are display faces with almost nothing outside ASCII, so
+    // a tick or a chevron written in ordinary text came out as the replacement
+    // box glyph 0 draws, while a terminal showed the real character from its own
+    // font. The two backends have to agree.
+    const gpa = std.testing.allocator;
+    try requireRaster(gpa);
+    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    defer sel.device.deinit();
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+
+    // The premise: neither of these is in the face. If one ever is, this test is
+    // measuring something else and says so rather than passing quietly.
+    try std.testing.expect(!font.hasGlyph('\u{25B8}'));
+    try std.testing.expect(!font.hasGlyph('\u{2603}'));
+
+    // U+25B8 has a mark; U+2603, a snowman, does not and keeps the box.
+    const marked = try renderOneCodepoint(gpa, sel.device, &font, '\u{25B8}');
+    defer gpa.free(marked);
+    const unmarked = try renderOneCodepoint(gpa, sel.device, &font, '\u{2603}');
+    defer gpa.free(unmarked);
+
+    // Both are glyph 0 to the face, so without the substitution these are the
+    // same pixels. That is the whole of the bug, and this is what separates
+    // them.
+    try std.testing.expect(!std.mem.eql(u8, marked, unmarked));
+
+    // And the mark drew something, rather than the substitution quietly
+    // dropping a codepoint it could not blit.
+    var lit: u32 = 0;
+    var i: usize = 0;
+    while (i < marked.len) : (i += 4) {
+        if (marked[i] > 40) lit += 1;
+    }
+    try std.testing.expect(lit > 10);
+}
+
+test "the two spellings of one mark draw the same thing" {
+    // U+25B6 and U+25B8 are the large and small right-pointing triangles. A
+    // caller writes whichever it prefers and means the same mark, so both reach
+    // the same built-in and draw identically.
+    const gpa = std.testing.allocator;
+    try requireRaster(gpa);
+    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    defer sel.device.deinit();
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+
+    const large = try renderOneCodepoint(gpa, sel.device, &font, '\u{25B6}');
+    defer gpa.free(large);
+    const small = try renderOneCodepoint(gpa, sel.device, &font, '\u{25B8}');
+    defer gpa.free(small);
+    try std.testing.expectEqualSlices(u8, large, small);
 }

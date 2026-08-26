@@ -13,8 +13,40 @@ const compositor_builds = phantom.backend.prism.builds_here;
 
 const lattice = if (compositor_builds) @import("lattice") else void;
 
-/// Whether a window can actually be opened here, asked of lattice rather than
-/// guessed from the environment.
+/// A window that has been opened, before a session has been built on it.
+///
+/// This exists so the question and the answer are the same act. `open` cannot
+/// tell a caller a window is possible without opening one, and a caller that
+/// then threw that away and opened a second would pay for the whole connection
+/// twice: a round trip, the globals, the driver, the seat bind.
+///
+/// The lattice `Context` is a backend pointer and a flag, with every piece of
+/// real state behind that pointer, so handing one over is a copy of two words
+/// and not a move of anything live.
+///
+/// Whoever holds this owns it. `Session.initOn` takes it; anyone else calls
+/// `close`.
+pub const Opening = if (compositor_builds) struct {
+    ctx: lattice.Context,
+    surface: lattice.Surface,
+
+    /// Give back the window and the connection, for a caller that asked whether
+    /// a window was possible and is not going to draw in one.
+    pub fn close(self: *Opening) void {
+        self.ctx.destroySurface(self.surface.id);
+        self.ctx.deinit();
+        self.* = undefined;
+    }
+} else struct {
+    /// Never built: `open` reports null wherever the compositor path does not
+    /// compile. The empty shape is what keeps `open`'s signature analyzable on
+    /// a target where `lattice` is a `void`.
+    pub fn close(self: *Opening) void {
+        _ = self;
+    }
+};
+
+/// Open a window, or report that this machine cannot.
 ///
 /// lattice resolves its own backend from `WAYLAND_DISPLAY`, `DISPLAY`,
 /// `XDG_SESSION_TYPE` and the DRM device, and its rules are not the obvious
@@ -23,29 +55,67 @@ const lattice = if (compositor_builds) @import("lattice") else void;
 /// one, and the way it would disagree is that phantom would choose the window
 /// backend under X11 and lattice would then quietly render to nothing.
 ///
-/// So this asks by opening a context and reading back what lattice gave it. A
-/// backend with no outputs has no screen to put a window on, which is what the
-/// headless backend reports, and it is the signal available today without
-/// lattice having to expose the resolved backend kind.
+/// So this does not predict. It opens the context, checks that lattice gave it
+/// a render device and a screen, and then CREATES THE SURFACE, because that is
+/// the step that fails on a backend which answers every earlier question and
+/// still cannot put a window up. A probe that stopped before it would report
+/// yes and leave the real start to fail with `NotImplemented`.
 ///
-/// The context is opened and closed again, which costs a compositor round trip
-/// once at startup. That is worth more than a guess that can be wrong.
-pub fn available(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) bool {
+/// Null means no window here, with everything this opened already closed.
+pub fn open(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    opts: Options,
+) ?Opening {
     // An `if` on a comptime-known condition drops the untaken branch before
     // analysis, which is what keeps `lattice` (a `void` wherever the compositor
     // path does not build) from being reached for members it does not have. An
-    // early `return false` above would NOT do that: the rest of the body sits at
+    // early `return null` above would NOT do that: the rest of the body sits at
     // function scope and is analyzed either way. An aarch64-macos build is what
     // caught this.
     if (compositor_builds) {
-        var ctx = lattice.Context.init(gpa, io, environ, .{}) catch return false;
-        defer ctx.deinit();
+        var ctx = lattice.Context.init(gpa, io, environ, .{
+            .initial_width = opts.width,
+            .initial_height = opts.height,
+            .driver = opts.driver,
+        }) catch return null;
         // A render device is as necessary as a screen: without one there is
         // nothing to draw the window's contents with.
-        if (ctx.renderDevice() == null) return false;
-        return ctx.outputs().len > 0;
+        if (ctx.renderDevice() == null) {
+            ctx.deinit();
+            return null;
+        }
+        // No outputs is what the headless backend reports, and a backend with no
+        // screen has nowhere to put a window.
+        if (ctx.outputs().len == 0) {
+            ctx.deinit();
+            return null;
+        }
+        const surface = ctx.createSurface(.{
+            .title = opts.title,
+            .width = opts.width,
+            .height = opts.height,
+            .color = lattice.ColorConfig.sdr(.xrgb8888),
+        }) catch {
+            ctx.deinit();
+            return null;
+        };
+        return .{ .ctx = ctx, .surface = surface };
     }
-    return false;
+    return null;
+}
+
+/// Whether a window can be opened here.
+///
+/// The yes or no on its own, for a caller with nothing to do with the window it
+/// proves. It opens one and closes it again, so a caller that WILL go on to
+/// draw should call `open` and keep what it gets: that is the same answer
+/// without paying for the connection twice.
+pub fn available(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) bool {
+    var opened = open(gpa, io, environ, .{}) orelse return false;
+    opened.close();
+    return true;
 }
 
 /// Fold a lattice key event into the shared phantom key event. lattice has
@@ -123,17 +193,32 @@ pub const App = struct {
         // is a `void`. It is the one gate in this file, so a caller never needs
         // one of its own: `app.zig` calls this unconditionally.
         if (compositor_builds) {
+            const opened = open(process.gpa, process.io, process.environ_map, opts) orelse
+                return error.NoWindowBackend;
+            return runOn(process, opened, root, opts);
+        }
+        // Only reachable through `PHANTOM_BACKEND=gpu`, since `open` reports null
+        // here and nothing else selects this backend.
+        return error.NoWindowBackend;
+    }
+
+    /// The same, on a window that is already open.
+    ///
+    /// `app.zig` takes this path: it has to open a window to know whether it can
+    /// have one, and this is what keeps that window instead of dropping it and
+    /// connecting a second time. Takes ownership of `opened`, whether it returns
+    /// an error or not.
+    pub fn runOn(process: std.process.Init, opened: Opening, root: phantom.Root, opts: Options) !void {
+        if (compositor_builds) {
             // A Session holds pointers into its own fields, so it must be built
             // at an address that does not move: see `tui.Tui.run`, which says
             // the same of its own session for the same reason.
             var session: Session = undefined;
-            try session.init(process.gpa, process.io, process.environ_map, root, opts);
+            try session.initOn(process.gpa, process.io, opened, root, opts);
             defer session.deinit();
             while (try session.step()) {}
             return;
         }
-        // Only reachable through `PHANTOM_BACKEND=gpu`, since `available` reports
-        // false here and nothing else selects this backend.
         return error.NoWindowBackend;
     }
 };
@@ -177,6 +262,8 @@ pub const Session = struct {
     last_point: phantom.PhysicalOffset,
     /// Physical pixels for each logical pixel, applied to incoming pointer
     /// coordinates as well as to layout. See `step` for why it is 1.0 today.
+    /// Whether the last `step` drew. Read through `drewFrame`.
+    drew_frame: bool,
     scale: f32,
     running: bool,
 
@@ -196,17 +283,41 @@ pub const Session = struct {
         root: phantom.Root,
         opts: Options,
     ) !void {
+        const opened = open(gpa, io, environ, opts) orelse return error.NoWindowBackend;
+        return self.initOn(gpa, io, opened, root, opts);
+    }
+
+    /// Build a session on a window that is already open, taking it over.
+    ///
+    /// For a caller that asked whether a window was possible and got one back
+    /// from `open`: that connection is the connection to draw on, and opening a
+    /// second would pay the whole cost again for an answer it already has.
+    ///
+    /// This takes ownership either way. On success `deinit` gives the window
+    /// back; on failure this closes it before returning, so a caller that gets
+    /// an error must NOT call `deinit` and must NOT call `Opening.close`.
+    pub fn initOn(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        opened: Opening,
+        root: phantom.Root,
+        opts: Options,
+    ) !void {
         self.gpa = gpa;
         self.io = io;
         self.opts = opts;
 
-        self.ctx = try lattice.Context.init(gpa, io, environ, .{
-            .initial_width = opts.width,
-            .initial_height = opts.height,
-            .driver = opts.driver,
-        });
-        errdefer self.ctx.deinit();
+        self.ctx = opened.ctx;
+        self.surface = opened.surface;
+        errdefer {
+            self.ctx.destroySurface(self.surface.id);
+            self.ctx.deinit();
+        }
 
+        // `open` already found a device, so this cannot fail through that path.
+        // It is still asked rather than assumed, because the answer is the one
+        // the backend is built on.
         const dev = self.ctx.renderDevice() orelse return error.NoRenderDevice;
         self.backend = try phantom.backend.PrismBackend.init(dev.*, gpa);
         errdefer self.backend.deinit();
@@ -214,14 +325,6 @@ pub const Session = struct {
         // so the top-left frontend coordinate space presents upright. Offscreen
         // goldens leave this false.
         self.backend.flip_y = true;
-
-        self.surface = try self.ctx.createSurface(.{
-            .title = opts.title,
-            .width = opts.width,
-            .height = opts.height,
-            .color = lattice.ColorConfig.sdr(.xrgb8888),
-        });
-        errdefer self.ctx.destroySurface(self.surface.id);
 
         self.diag_writer = std.Io.File.stderr().writerStreaming(io, &self.diag_buf);
         self.arena = std.heap.ArenaAllocator.init(gpa);
@@ -277,6 +380,7 @@ pub const Session = struct {
         self.last_point = phantom.PhysicalOffset.zero;
         self.scale = 1.0;
         self.running = true;
+        self.drew_frame = false;
     }
 
     /// Put back everything `init` set up, tree first and window last, so nothing
@@ -296,11 +400,27 @@ pub const Session = struct {
     /// Draw a frame if the compositor is ready for one, then take in whatever
     /// events have arrived. Returns false once the window has closed, at which
     /// point the caller stops calling it and calls `deinit`.
+    ///
+    /// The return value is whether the session is still running and NOT whether
+    /// it drew: a compositor that is not ready for a frame yet is the normal
+    /// case, not the end of the session. Ask `drewFrame` for that, which is a
+    /// question only this backend raises. `tui.Session.step` draws every time,
+    /// because a terminal has nothing to hold a frame back.
     pub fn step(self: *Session) !bool {
         if (!self.running) return false;
-        if (self.ctx.renderAvailable(self.surface.id)) try self.renderFrame();
+        self.drew_frame = self.ctx.renderAvailable(self.surface.id);
+        if (self.drew_frame) try self.renderFrame();
         try self.ctx.poll(self.opts.poll_ms, handleEvent, self);
         return self.running;
+    }
+
+    /// Whether the last `step` drew a frame.
+    ///
+    /// False when the compositor was not ready for one, which is what `step`
+    /// alone cannot tell a caller that tracks repaints. A `step` that returned
+    /// false, or one that has not run yet, reports false: nothing was drawn.
+    pub fn drewFrame(self: *const Session) bool {
+        return self.drew_frame;
     }
 
     /// Stop at the end of the current turn. Safe to call from a widget callback
@@ -313,19 +433,18 @@ pub const Session = struct {
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = &self.owner };
         const ts = std.Io.Clock.now(.awake, self.io);
         self.owner.scheduler.tick(ts.nanoseconds);
-        self.owner.flushDirty(&bctx);
-        // A rebuild can add or remove focusable nodes, so the traversal order is
-        // rebuilt from the tree rather than kept incrementally.
-        try self.focus_mgr.collect(self.gpa, self.el);
 
+        // The size comes FIRST, before anything builds. A widget reads it through
+        // `MediaQuery.of` during its build, so metrics published after
+        // `flushDirty` are the metrics of the frame before: a window resize then
+        // takes two frames to show, and the first of them lays out the new size
+        // with the old numbers. Asking the surface for its target is what makes
+        // the current size known, so that has to move up here too.
         const rt = try self.ctx.renderTarget(self.surface.id);
         const vp = phantom.PhysicalSize{
             .width = @floatFromInt(rt.width),
             .height = @floatFromInt(rt.height),
         };
-        self.canvas.clear();
-        const ro = self.el.renderObject() orelse return error.NoRootRenderObject;
-
         // Native has no buffer scaling (lattice sets neither set_buffer_scale
         // nor fractional-scale), so the surface, the framebuffer AND the
         // wl_pointer surface-local coordinates are all the SAME physical pixels
@@ -345,6 +464,14 @@ pub const Session = struct {
             .dpr = self.scale,
             .text_scale = 1.0,
         });
+
+        self.owner.flushDirty(&bctx);
+        // A rebuild can add or remove focusable nodes, so the traversal order is
+        // rebuilt from the tree rather than kept incrementally.
+        try self.focus_mgr.collect(self.gpa, self.el);
+
+        self.canvas.clear();
+        const ro = self.el.renderObject() orelse return error.NoRootRenderObject;
         _ = ro.layout(phantom.BoxConstraints.tightScaled(vp, self.scale));
         try ro.paint(&self.canvas, phantom.PhysicalOffset.zero);
         try self.backend.render(
@@ -478,4 +605,135 @@ test "the default options open the window phantom has always opened" {
     try std.testing.expect(o.driver == null);
     // A frame at 60Hz, which is what `App.run` waited before the split.
     try std.testing.expectEqual(@as(?u32, 16), o.poll_ms);
+}
+
+// ---------------------------------------------------------------------------
+// Session tests
+//
+// lattice's headless backend carries a real prism device, a surface and a
+// render target, so a whole `Session` runs on it with no compositor. That is
+// what makes the two behaviours below testable at all: everything else about
+// the window path needs a display.
+// ---------------------------------------------------------------------------
+
+/// A window session standing on lattice's headless backend, with the pieces a
+/// test needs to reach: `h` to move the surface size or hold a frame back.
+const Fixture = struct {
+    threaded: std.Io.Threaded,
+    h: *lattice.backends.Headless,
+    session: Session,
+
+    fn open(f: *Fixture, gpa: std.mem.Allocator, root: phantom.Root) !void {
+        try phantom.backend.prism.requireRaster(gpa);
+        f.threaded = std.Io.Threaded.init(gpa, .{});
+        errdefer f.threaded.deinit();
+        const io = f.threaded.io();
+
+        f.h = try lattice.backends.Headless.init(gpa);
+        var ctx = lattice.Context.initWithBackend(f.h.backend());
+        errdefer ctx.deinit();
+        const surface = try ctx.createSurface(.{
+            .title = "test",
+            .width = 800,
+            .height = 600,
+            .color = lattice.ColorConfig.sdr(.xrgb8888),
+        });
+        // `initOn` takes the window over, which is the seam this exercises.
+        try f.session.initOn(gpa, io, .{ .ctx = ctx, .surface = surface }, root, .{ .poll_ms = 0 });
+    }
+
+    fn close(f: *Fixture) void {
+        f.session.deinit();
+        f.threaded.deinit();
+    }
+};
+
+test "a step that drew and a step that did not are told apart" {
+    // `step` returns whether the session is still running, so a compositor that
+    // is not ready for a frame and a session that is still going look the same
+    // from the outside. A caller tracking repaints needs the other answer.
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    f.open(gpa, phantom.Root.plain(testRoot)) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer f.close();
+
+    // Nothing has run yet, so nothing has been drawn.
+    try std.testing.expect(!f.session.drewFrame());
+
+    f.h.setRenderAvailable(true);
+    try std.testing.expect(try f.session.step());
+    try std.testing.expect(f.session.drewFrame());
+
+    // The compositor holds the next frame back. The session is still running,
+    // and that is exactly the case the return value cannot express.
+    f.h.setRenderAvailable(false);
+    try std.testing.expect(try f.session.step());
+    try std.testing.expect(!f.session.drewFrame());
+
+    // And it recovers, rather than latching off.
+    f.h.setRenderAvailable(true);
+    try std.testing.expect(try f.session.step());
+    try std.testing.expect(f.session.drewFrame());
+}
+
+/// Records the viewport width every time it builds. A resize has to reach a
+/// build, and this is what reports which frame's numbers it saw.
+var seen_width: f32 = 0;
+
+var reader_state: ?*SizeReader.State = null;
+
+const SizeReader = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        pub fn build(s: *State, bctx: *phantom.BuildContext) anyerror!phantom.Widget {
+            // The framework owns the state, so the test reaches it through here.
+            reader_state = s;
+            seen_width = phantom.MediaQuery.of(bctx).size.width;
+            return (phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 0) }).widget();
+        }
+    };
+    pub fn widget(self: *const SizeReader) phantom.Widget {
+        return phantom.StatefulWidget(SizeReader, self);
+    }
+};
+
+var size_reader = SizeReader{};
+
+fn sizeReaderRoot(_: *phantom.BuildContext) phantom.Widget {
+    return size_reader.widget();
+}
+
+fn testRoot(_: *phantom.BuildContext) phantom.Widget {
+    return (phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 0) }).widget();
+}
+
+test "a build sees the size of the frame it is building, not the one before" {
+    // `renderFrame` used to publish the viewport AFTER `flushDirty`, so a widget
+    // reading `MediaQuery.of` during its build got the previous frame's numbers.
+    // A window resize then took two frames to show, and the first of them laid
+    // out the new size with the old width.
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    f.open(gpa, phantom.Root.plain(sizeReaderRoot)) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer f.close();
+
+    f.h.setRenderAvailable(true);
+    _ = try f.session.step();
+    try std.testing.expectEqual(@as(f32, 800), seen_width);
+
+    // The surface is now wider, which is what a compositor resize looks like
+    // from the render target's side.
+    f.h.tw = 1024;
+    // Dirty the tree so the next frame rebuilds. Without this `flushDirty` has
+    // nothing to do and the test would pass whatever the order was.
+    phantom.markNeedsBuild(reader_state.?);
+    seen_width = 0;
+    _ = try f.session.step();
+    try std.testing.expectEqual(@as(f32, 1024), seen_width);
 }
