@@ -764,19 +764,22 @@ pub const PrismBackend = struct {
 /// JIT. That retires this constant, and nothing in phantom has to change for it.
 pub const builds_here = builtin.os.tag != .windows;
 
-/// Whether a device on this machine can actually draw, not merely start.
+/// Whether this machine can draw PHANTOM'S primitives, not merely draw.
 ///
-/// `createBestDevice` returns the first driver whose `createDevice` SUCCEEDS,
-/// and success there says nothing about whether geometry reaches the target.
-/// prism's `software` driver currently clears the background correctly and then
-/// draws no primitives at all, so a frame comes back the colour it was cleared
-/// to with nothing on it. That is the only driver available in a build sandbox
-/// or on a machine with no GPU, which is where this matters.
+/// prism's `createBestDevice` now checks that the device it hands back can put a
+/// triangle on a target, so the old reason for this probe is gone: it used to
+/// return the first driver that merely STARTED, and a compute-only driver starts
+/// perfectly well. This is the narrower question that remains, and it is a real
+/// one, because the two probes ask about different shaders. prism's uses one
+/// attribute; phantom's rounded rect uses four, and a driver has been known to
+/// draw the first and silently drop the second (prism's software rasterizer
+/// dropped every shader with more than eight scalar inputs, which is exactly
+/// what phantom's rects have and its text does not).
 ///
-/// So this asks the question that counts: draw one opaque rectangle over a
-/// contrasting background and read the centre pixel back. Anything other than
+/// So this draws one opaque rectangle THROUGH PHANTOM'S OWN PIPELINE, over a
+/// contrasting background, and reads the centre pixel back. Anything other than
 /// the rectangle's own colour, including an error anywhere along the way, means
-/// this environment cannot rasterize.
+/// this environment cannot rasterize what phantom draws.
 ///
 /// Cached, because the answer cannot change while the process runs and the probe
 /// costs a device bring-up. The cache is a file-level global, which this project
