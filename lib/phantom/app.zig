@@ -104,10 +104,28 @@ pub const App = struct {
         // stdout alone and never falls back to stderr.
         const is_tty = std.Io.File.stdout().isTty(init.io) catch false;
         // Asked of lattice, not guessed from the environment: see
-        // `selectBackend`, and `window.available` for what lattice is asked.
-        const window_possible = phantom.window.available(init.gpa, init.io, init.environ_map);
-        switch (selectBackend(init.environ_map, window_possible, is_tty)) {
-            .gpu => return phantom.window.App.run(init, root, .{}),
+        // `selectBackend`, and `window.open` for what lattice is asked.
+        //
+        // The window it opens IS the window the session runs on. Opening one is
+        // the only honest way to know a window is possible, so the answer comes
+        // with the thing itself, and dropping it here would mean connecting a
+        // second time for something already in hand.
+        const opts = phantom.window.Options{};
+        var opened = phantom.window.open(init.gpa, init.io, init.environ_map, opts);
+        // Whatever this function does next, an unused window is given back. Every
+        // path that takes it over clears this first, so it is closed once or not
+        // at all.
+        defer if (opened) |*o| o.close();
+
+        switch (selectBackend(init.environ_map, opened != null, is_tty)) {
+            .gpu => {
+                const win = opened orelse
+                    // Only reachable through `PHANTOM_BACKEND=gpu`, which asks
+                    // for the window path on a machine that has no window.
+                    return error.NoWindowBackend;
+                opened = null;
+                return phantom.window.App.runOn(init, win, root, opts);
+            },
             .tui => return phantom.Tui.run(init, root, .{}),
             .none => {
                 // A clear message, because "it did nothing" is the worst outcome here.

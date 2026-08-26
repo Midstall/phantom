@@ -40,6 +40,10 @@ pub const Id = enum(u32) {
     minus = 9,
     rule_vertical = 10,
     rule_horizontal = 11,
+
+    /// Three dots on the midline, for elided content. U+22EF, which no bundled
+    /// face has either.
+    ellipsis = 12,
 };
 
 /// What a cell backend draws in place of the mark.
@@ -84,6 +88,41 @@ pub fn cellMarkFor(id: Id) ?CellMark {
         .minus => .{ .cp = '-' },
         .rule_vertical => .{ .cp = '\u{2502}', .tile = true },
         .rule_horizontal => .{ .cp = '\u{2500}', .tile = true },
+        .ellipsis => .{ .cp = '\u{22EF}' },
+    };
+}
+
+/// The mark to draw in place of `cp` when the face has no glyph for it, or null
+/// when nothing here means that codepoint.
+///
+/// The bundled faces are display faces: every non-ASCII codepoint probed
+/// resolves to glyph 0, so text carrying one of these draws a replacement box in
+/// pixel mode while a terminal draws it correctly from its own font. That split
+/// is what this closes. A caller writes the character it means, in ordinary
+/// text, and both modes show the same thing.
+///
+/// This is `cellMarkFor` read backwards, plus the near neighbours: a caller
+/// reaching for a right-pointing triangle may write the small one or the large
+/// one, and both mean the same mark. Nothing here is a substitution between
+/// DIFFERENT marks, only between spellings of one.
+///
+/// Only codepoints with a real mark belong here. A face that is missing a letter
+/// is a fault to see, not to paper over.
+pub fn iconForCodepoint(cp: u21) ?Id {
+    return switch (cp) {
+        '\u{2713}' => .check,
+        '\u{2717}' => .cross,
+        // Both sizes of each geometric triangle. U+25B8 and U+25BE are what a
+        // terminal interface usually reaches for, being lighter beside text.
+        '\u{25C0}', '\u{25C2}' => .chevron_left,
+        '\u{25B6}', '\u{25B8}' => .chevron_right,
+        '\u{25B2}', '\u{25B4}' => .chevron_up,
+        '\u{25BC}', '\u{25BE}' => .chevron_down,
+        '\u{2192}' => .arrow_right,
+        '\u{2502}' => .rule_vertical,
+        '\u{2500}' => .rule_horizontal,
+        '\u{22EF}' => .ellipsis,
+        else => null,
     };
 }
 
@@ -102,6 +141,7 @@ pub fn pathFor(id: Id) path.Path {
         .minus => minus,
         .rule_vertical => rule_vertical,
         .rule_horizontal => rule_horizontal,
+        .ellipsis => ellipsis,
     };
 }
 
@@ -381,6 +421,18 @@ const plus = path.Path{ .verbs = &.{
 const minus = path.Path{ .verbs = &.{
     .{ .move = .{ .x = 5, .y = 12 } },
     .{ .line = .{ .x = 19, .y = 12 } },
+} };
+
+/// Three dots on the midline. Drawn as three of the shortest strokes the round
+/// cap can make, so each reads as a dot rather than a dash: a zero length
+/// segment would be culled before it reached the rasterizer.
+const ellipsis = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 12 } },
+    .{ .line = .{ .x = 5.01, .y = 12 } },
+    .{ .move = .{ .x = 12, .y = 12 } },
+    .{ .line = .{ .x = 12.01, .y = 12 } },
+    .{ .move = .{ .x = 19, .y = 12 } },
+    .{ .line = .{ .x = 19.01, .y = 12 } },
 } };
 
 /// Full bleed and butt capped, so stacking one per row draws a continuous rail

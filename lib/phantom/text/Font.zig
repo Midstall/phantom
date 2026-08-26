@@ -79,6 +79,17 @@ pub fn descent(self: *const Font) i16 {
     return self.metrics.descent;
 }
 
+/// Whether this face can draw `cp` at all.
+///
+/// Glyph 0 is the `.notdef` box every face reserves for a codepoint it does not
+/// cover, so a face that "draws" it draws a replacement box. The bundled faces
+/// are display faces and cover little outside ASCII, which is what makes this
+/// worth asking: see `backend/prism.zig`, which substitutes a built-in mark
+/// rather than blit the box.
+pub fn hasGlyph(self: *const Font, cp: u21) bool {
+    return self.metrics.glyphIndex(cp) != 0;
+}
+
 /// Horizontal advance of `cp` at `px_size` pixels (device space). Metrics only,
 /// no rasterization, no allocation.
 pub fn advance(self: *const Font, cp: u21, px_size: f32) f32 {
