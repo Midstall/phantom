@@ -9,8 +9,8 @@
             .hash = "webidl_zig-0.1.0-FrIyV_uUBgAGtNwP-OkLegPJMWUnpeKuPqDdVbWyC9Fn",
         },
         .lattice = .{
-            .url = "git+https://github.com/Midstall/lattice#416c0c843024ed404a31ac771f59bd08577bfc07",
-            .hash = "lattice-0.1.0-TdtxHP-_CQCkiF469-GKB_0p5l_Tkl1HhVMGXwbfVbkT",
+            .url = "git+https://github.com/Midstall/lattice#50f9aab10366c8febea0143de2ea3b5286ce9fd6",
+            .hash = "lattice-0.1.0-TdtxHLq_CQAPjFXEmOLb0CyeavrcA8Nn4_kMiR-opK2X",
         },
         .prism = .{
             .url = "git+https://github.com/Midstall/prism#af4b1a08c0cf31b8c87eeb1966ff3a1aae5af767",
