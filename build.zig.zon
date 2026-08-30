@@ -5,16 +5,16 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .webidl = .{
-            .url = "git+https://github.com/Midstall/webidl.zig#4b0d3c61d5f22e6072e9eacf03174e4e8393c6a2",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/webidl.zig#4b0d3c61d5f22e6072e9eacf03174e4e8393c6a2",
             .hash = "webidl_zig-0.1.0-FrIyV_uUBgAGtNwP-OkLegPJMWUnpeKuPqDdVbWyC9Fn",
         },
         .lattice = .{
-            .url = "git+https://github.com/Midstall/lattice#50f9aab10366c8febea0143de2ea3b5286ce9fd6",
-            .hash = "lattice-0.1.0-TdtxHLq_CQAPjFXEmOLb0CyeavrcA8Nn4_kMiR-opK2X",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#dd3689d9bab243ae9d5776d08c8209b144e98829",
+            .hash = "lattice-0.1.0-TdtxHADACQClOR_Sn9GaSA84Eggw582e0lLhkLOQSDa8",
         },
         .prism = .{
-            .url = "git+https://github.com/Midstall/prism#af4b1a08c0cf31b8c87eeb1966ff3a1aae5af767",
-            .hash = "prism-0.1.0-PSE12HO7OAB8DwHKvMnWIR_efUm7j_Qe0cXRtpjO0J-u",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/prism#43fab514fba26d2007398b05b16c8de7a8c8c91a",
+            .hash = "prism-0.1.0-PSE12KW7OADB_fa5dVGw90h98A_jQRpU0nZhu9j8WJNJ",
         },
     },
     .paths = .{
