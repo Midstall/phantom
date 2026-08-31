@@ -66,6 +66,13 @@ scheduler: Scheduler = .{},
 /// sets it again on each resize. The field is read through a stable pointer that
 /// `RenderText` holds, so a change reaches every mounted text node with no rebuild.
 text_metrics: mono.TextMetrics = .proportional,
+/// True after `Router.State.push` or `.replace` changes the route, until the
+/// next render consumes it. A web render carries scroll position across a
+/// rebuild by creation order, which is right for a tap and wrong for a
+/// navigation: a visitor on a new route expects its top. `web.WebApp.render`
+/// reads this once per render and clears it, so only the render right after
+/// a navigation drops the carried offsets.
+route_changed: bool = false,
 
 pub fn deinit(self: *BuildOwner) void {
     self.scheduler.deinit(self.gpa);

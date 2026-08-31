@@ -29,7 +29,10 @@ pub const FaultCode = enum {
     location_too_long,
     /// A clip or scroll region nested deeper than the backend can track. The
     /// region past the limit is not opened, so content painted inside it lands
-    /// in its parent's space instead of a silently wrong one.
+    /// in its parent's space instead of a silently wrong one. Also used when
+    /// one frame opens more scroll regions than the backend can remember
+    /// offsets for: the region past that limit still opens, it just resets to
+    /// the top on every rebuild instead of keeping its scroll position.
     region_overflow,
 };
 

@@ -190,6 +190,21 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\    const el = dom.Element{{ .handle = node }};
         \\    el.set_innerHTML("");
         \\}}
+        \\// A tap rebuilds the whole DOM (see phantom.backend.dom_calls.render), so
+        \\// the browser-owned scroll position of an open region would reset to the
+        \\// top on every tap unless it is read back before the old div is thrown
+        \\// away and written onto the new one. These two hooks are that read/write.
+        \\fn readScrollOffset(ctx: *anyopaque, node: u32) phantom.PhysicalOffset {{
+        \\    _ = ctx;
+        \\    const el = dom.Element{{ .handle = node }};
+        \\    return .{{ .x = @floatCast(el.get_scrollLeft()), .y = @floatCast(el.get_scrollTop()) }};
+        \\}}
+        \\fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: phantom.PhysicalOffset) void {{
+        \\    _ = ctx;
+        \\    const el = dom.Element{{ .handle = node }};
+        \\    el.set_scrollLeft(@floatCast(offset.x));
+        \\    el.set_scrollTop(@floatCast(offset.y));
+        \\}}
         \\
         \\// Reads the address bar into buf, according to the build's url strategy. A
         \\// hash strategy trims the leading '#' and reads an empty hash as "/", so a
@@ -270,6 +285,8 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\        .open_url = openUrl,
         \\        .read_location = readLocation,
         \\        .write_location = writeLocation,
+        \\        .read_scroll_offset = readScrollOffset,
+        \\        .write_scroll_offset = writeScrollOffset,
         \\    }};
         \\    const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
         \\    const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root),

@@ -42,6 +42,15 @@ pub const DomOps = struct {
     read_location: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
+    /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the
+    /// host. Null on a host that cannot read it back; `render` then carries no
+    /// offset across a rebuild, which is today's behaviour: a tap resets every
+    /// open region to the top.
+    read_scroll_offset: ?*const fn (ctx: *anyopaque, node: u32) geometry.PhysicalOffset = null,
+    /// Sets a scroll region's offset on the host. Null on a host that cannot
+    /// write it; `render` then leaves a rebuilt region wherever a fresh
+    /// element starts, which is today's behaviour.
+    write_scroll_offset: ?*const fn (ctx: *anyopaque, node: u32, offset: geometry.PhysicalOffset) void = null,
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -64,6 +73,17 @@ pub const DomOps = struct {
     }
     pub fn clearChildren(self: DomOps, node: u32) void {
         self.clear_children(self.ctx, node);
+    }
+    /// Null when the host has no read hook, so a caller cannot tell "no host
+    /// support" from "the offset is zero" and must treat both the same way:
+    /// nothing to carry across the rebuild.
+    pub fn readScrollOffset(self: DomOps, node: u32) ?geometry.PhysicalOffset {
+        const f = self.read_scroll_offset orelse return null;
+        return f(self.ctx, node);
+    }
+    pub fn writeScrollOffset(self: DomOps, node: u32, offset: geometry.PhysicalOffset) void {
+        const f = self.write_scroll_offset orelse return;
+        f(self.ctx, node, offset);
     }
 };
 
@@ -90,6 +110,27 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
 /// list rather than reading or writing past a fixed stack.
 pub const max_region_depth = 32;
 
+/// How many scroll regions `render` remembers offsets for across a rebuild.
+/// Unlike `max_region_depth`, this counts every open region in one frame, not
+/// only how deep they nest, because sibling regions do not nest at all. Same
+/// bound style as `max_region_depth`: a page past the limit still renders,
+/// the regions past it just fall back to today's behaviour (reset to the
+/// top), and a fault is reported rather than writing past a fixed array.
+pub const max_scroll_regions = 32;
+
+/// Scroll offsets carried across a rebuild, keyed by creation order. A tap
+/// rebuilds the whole DOM (see `render`), which would otherwise hand the
+/// scroll position of every open region back to the browser's default of
+/// zero. A caller (`WebApp`) owns one instance for the life of the page and
+/// passes a pointer to every `render` call; passing null opts out of
+/// carrying scroll state entirely.
+pub const ScrollMemory = struct {
+    /// The outer div handle of each scroll region `render` created last
+    /// frame, in creation order.
+    handles: [max_scroll_regions]u32 = undefined,
+    count: usize = 0,
+};
+
 /// One open clip or scroll region: the append target and coordinate origin its
 /// matching push saw before it changed them. A pop restores exactly this, so a
 /// region nested inside another one cannot leak its coordinates into whatever
@@ -102,7 +143,34 @@ const RegionFrame = struct {
 /// Rebuild the whole document body's child tree from the display list. `sink`
 /// records a fault when the display list nests more clip/scroll regions than
 /// `max_region_depth`; pass null where no sink is wired up.
-pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink) !void {
+///
+/// `mem`, if given, carries scroll offsets across the rebuild: the region a
+/// tap would otherwise reset to the top instead keeps the position the
+/// browser already had it at. Pass null to opt out.
+///
+/// `reset_scroll` is true exactly once, on the render that follows a
+/// navigation: the caller is expected to clear it after that one call. A
+/// visitor arriving at a new route expects its top, not wherever the
+/// previous route happened to be scrolled to, so this render drops `mem`'s
+/// saved offsets instead of applying them.
+pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, reset_scroll: bool) !void {
+    // Read every remembered region's live offset before its div is destroyed
+    // below. Skipped on a navigation (the new page starts at the top) and
+    // when the host cannot read scroll position at all.
+    var saved: [max_scroll_regions]geometry.PhysicalOffset = undefined;
+    var saved_count: usize = 0;
+    if (mem) |m| {
+        if (!reset_scroll and ops.read_scroll_offset != null) {
+            for (m.handles[0..m.count]) |h| {
+                saved[saved_count] = ops.readScrollOffset(h) orelse break;
+                saved_count += 1;
+            }
+        }
+        // This frame's regions are recorded fresh as they are created below,
+        // in the loop over `list.primitives`.
+        m.count = 0;
+    }
+
     ops.clearChildren(ops.body);
 
     // Collect distinct fonts once; used for text primitive font-family index lookups.
@@ -337,6 +405,21 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const inner = ops.createElement("div");
                 ops.setAttribute(inner, "style", inner_style);
                 ops.appendChild(outer, inner);
+                // This is the Nth region `render` has built this frame: give
+                // it the Nth saved offset (if there is one), then remember its
+                // handle so the render after next can read the offset back.
+                // Must come after `inner` is attached: `outer` has nothing to
+                // scroll to before that, so a browser clamps any offset back
+                // to zero rather than holding it for content not there yet.
+                if (mem) |m| {
+                    if (m.count < max_scroll_regions) {
+                        if (m.count < saved_count) ops.writeScrollOffset(outer, saved[m.count]);
+                        m.handles[m.count] = outer;
+                        m.count += 1;
+                    } else if (sink) |s| {
+                        s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
+                    }
+                }
                 // Children now append to the inner div; coords subtract the
                 // viewport origin. The frame this push saw goes on the stack, so
                 // the matching pop restores exactly it and not the top level.
@@ -422,11 +505,19 @@ pub const Recorder = struct {
     /// to its history yet.
     location_buf: [location_cap]u8 = undefined,
     location_len: usize = 0,
+    /// Scroll offsets a test has set, simulating the browser. Bounded, like
+    /// the rest of this mock; a test needs at most a handful of regions.
+    scroll_offsets: [scroll_offsets_cap]ScrollEntry = undefined,
+    scroll_offsets_len: usize = 0,
 
     /// Comfortably past `router.max_path`, so a test can park a location here
     /// that is too long for the router's own buffer without touching this
     /// buffer's limit.
     pub const location_cap = 512;
+
+    pub const scroll_offsets_cap = 8;
+
+    const ScrollEntry = struct { node: u32, offset: geometry.PhysicalOffset };
 
     /// Sets the location `read_location` reports, without recording a call.
     /// Lets a test start a Recorder already parked at a given address, the
@@ -447,6 +538,39 @@ pub const Recorder = struct {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.rec("writeLocation({s},{s})", .{ path, @tagName(mode) });
         self.setLocation(path);
+    }
+
+    /// Sets the offset `readScrollOffset` reports for `node`, without
+    /// recording a call. Lets a test simulate the browser having scrolled a
+    /// region, the same way `setLocation` simulates the address bar.
+    pub fn setScrollOffset(self: *Recorder, node: u32, offset: geometry.PhysicalOffset) void {
+        for (self.scroll_offsets[0..self.scroll_offsets_len]) |*e| {
+            if (e.node == node) {
+                e.offset = offset;
+                return;
+            }
+        }
+        self.scroll_offsets[self.scroll_offsets_len] = .{ .node = node, .offset = offset };
+        self.scroll_offsets_len += 1;
+    }
+
+    fn readScrollOffset(ctx: *anyopaque, node: u32) geometry.PhysicalOffset {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        var off = geometry.PhysicalOffset.zero;
+        for (self.scroll_offsets[0..self.scroll_offsets_len]) |e| {
+            if (e.node == node) {
+                off = e.offset;
+                break;
+            }
+        }
+        self.rec("readScrollOffset({d})->{d},{d}", .{ node, off.x, off.y });
+        return off;
+    }
+
+    fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: geometry.PhysicalOffset) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("writeScrollOffset({d},{d},{d})", .{ node, offset.x, offset.y });
+        self.setScrollOffset(node, offset);
     }
 
     fn rec(self: *Recorder, comptime fmt: []const u8, args: anytype) void {
@@ -514,6 +638,8 @@ pub const Recorder = struct {
             .head = 2,
             .read_location = readLocation,
             .write_location = writeLocation,
+            .read_scroll_offset = readScrollOffset,
+            .write_scroll_offset = writeScrollOffset,
         };
     }
 };
@@ -541,7 +667,7 @@ test "dom_calls: fill rrect creates a styled div appended to the container" {
         .radius = 4,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // clears body, builds the container, then the rrect div with the right style + append.
     try std.testing.expect(contains(rec.log.items, "clearChildren(1)"));
     try std.testing.expect(contains(rec.log.items, "position:relative;width:200px"));
@@ -565,7 +691,7 @@ test "dom_calls: text primitive records setTextContent with raw string and font-
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = geometry.PhysicalOffset{ .x = 5, .y = 8 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // The raw string is passed directly (browser handles escaping).
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "<b>hi</b>"));
     // The style div must carry font-family:pf0.
@@ -584,7 +710,7 @@ test "dom_calls: stroke rrect records a border:...solid rgba style" {
         .color = geometry.Color.rgb(0, 1, 0),
         .stroke_width = 2,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // Must have border-radius, box-sizing, and the border solid rgba style.
     try std.testing.expect(contains(rec.log.items, "box-sizing:border-box"));
     try std.testing.expect(contains(rec.log.items, "border:2px solid rgba("));
@@ -604,7 +730,7 @@ test "dom_calls: interactive fill rrect records class=pb0 and a style element wi
         .hover_color = geometry.Color.rgb(0, 0, 0.9),
         .active_color = geometry.Color.rgb(0, 0, 0.8),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // The div must carry class="pb0" via setAttribute.
     try std.testing.expect(contains(rec.log.items, "setAttribute(") and contains(rec.log.items, "class,pb0"));
     // A style element must be created and its textContent must contain the hover rule.
@@ -630,7 +756,7 @@ test "an interactive rectangle gets a pointer cursor and a plain one does not" {
         .radius = 0,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     try std.testing.expect(contains(rec.log.items, ".pb0{cursor:pointer}"));
     try std.testing.expect(!contains(rec.log.items, ".pb1"));
 }
@@ -663,7 +789,7 @@ test "dom_calls: a wrapped paragraph's three text runs each set a different line
         } });
         y += l.height;
     }
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
 
     // Three distinct setTextContent calls, one per line, exactly matching the
     // line each was drawn for.
@@ -694,7 +820,7 @@ test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" 
         .color = geometry.Color.rgb(1, 0, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // Outer div has overflow:scroll and the viewport position/size.
     try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
     try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:100px;height:50px;overflow:scroll"));
@@ -723,7 +849,7 @@ test "dom_calls: a clip nested in a scroll positions itself relative to the scro
     } });
     try list.append(gpa, .{ .pop_clip = {} });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     try std.testing.expect(contains(rec.log.items, "left:20px;top:30px;width:40px;height:40px"));
     // The un-adjusted absolute position must not appear: that would place the
     // clip twice as far from the scroll's own corner as it should be.
@@ -760,7 +886,7 @@ test "dom_calls: after a clip inside a scroll pops, later primitives return to t
         .color = geometry.Color.rgb(0, 1, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // container=101, scroll outer=102, scroll inner=103, clip div=104, first
     // rrect div=105, second rrect div=106.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,106)"));
@@ -799,7 +925,7 @@ test "dom_calls: after a scroll nested inside another scroll pops, later primiti
         .color = geometry.Color.rgb(0, 1, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 500 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 500 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // container=101, outer scroll outer/inner=102/103, inner scroll outer/inner=104/105,
     // first rrect div=106, second rrect div=107.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,107)"));
@@ -833,7 +959,7 @@ test "dom_calls: a region nested past max_region_depth is skipped and reports a 
         .radius = 0,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), &sink);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), &sink, null, false);
     try std.testing.expect(!sink.ok());
     try std.testing.expectEqual(FaultSink.FaultCode.region_overflow, sink.first.?.code);
     // container=101, then one div per honoured push (max_region_depth of them,
@@ -859,7 +985,7 @@ test "dom_calls: image with encoded bytes emits createElement(img), style, and d
         .rect = .{ .x = 5, .y = 15, .width = 64, .height = 32 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // A createElement("img") call must be recorded.
     try std.testing.expect(contains(rec.log.items, "createElement(img)"));
     // The style attribute must include left/top/width/height.
@@ -903,7 +1029,7 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
         .color = geometry.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
 
     // createElement("svg") builds an HTML unknown element that never paints, so
     // the namespaced call is the fact this pins.
@@ -939,7 +1065,7 @@ test "dom_calls: a labelled icon appends a namespaced title node holding the nam
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
 
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,title)"));
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "Genesis"));
@@ -964,7 +1090,7 @@ test "dom_calls: an icon with no label creates no title node" {
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     try std.testing.expect(!contains(rec.log.items, ",title)"));
     // The svg is still built, so this is not passing because nothing was drawn.
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,path)"));
@@ -987,7 +1113,7 @@ test "dom_calls: a host with no namespaced creator still builds the icon through
     } });
     var ops = rec.ops();
     ops.create_element_ns = null;
-    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     try std.testing.expect(contains(rec.log.items, "createElement(svg)"));
     try std.testing.expect(contains(rec.log.items, "createElement(path)"));
     try std.testing.expect(!contains(rec.log.items, "createElementNS("));
@@ -1006,7 +1132,7 @@ test "dom_calls: image fromRgba (no encoded bytes) emits no img element" {
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // No img element should be created (fromRgba has no encoded bytes).
     try std.testing.expect(!contains(rec.log.items, "createElement(img)"));
 }
@@ -1023,7 +1149,7 @@ test "a text run keeps its own spacing instead of letting the browser collapse i
     defer h.deinit();
     try h.pump();
 
-    try render(gpa, rec.ops(), h.canvas.list, .{ .width = 200, .height = 100 }, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, null);
+    try render(gpa, rec.ops(), h.canvas.list, .{ .width = 200, .height = 100 }, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, null, null, false);
 
     // Without this rule a browser drops the leading spaces of a run and
     // collapses every other stretch of them, so indented source loses its
@@ -1031,4 +1157,105 @@ test "a text run keeps its own spacing instead of letting the browser collapse i
     // re-space it.
     try std.testing.expect(contains(rec.log.items, "white-space:pre"));
     try std.testing.expect(contains(rec.log.items, "    indented"));
+}
+
+test "dom_calls: a scroll region's offset survives a second render at the same offset" {
+    // A tap rebuilds the whole DOM (see `render`'s doc comment), destroying
+    // the div the browser was scrolling and building a fresh one in its
+    // place. `mem` is what carries the old offset onto the new div, so a tap
+    // must never reset a region the visitor had scrolled.
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    // First render: container=101, scroll outer=102, inner=103.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expectEqual(@as(usize, 1), mem.count);
+    try std.testing.expectEqual(@as(u32, 102), mem.handles[0]);
+
+    // The visitor scrolls. The browser owns this value, not the framework, so
+    // the test moves it the same way the browser would: on the live node.
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+
+    // A tap: the whole tree rebuilds again. New container=104, new outer=105.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+
+    // The new region was handed back the offset the old one held.
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,77)"));
+    try std.testing.expectEqual(@as(u32, 105), mem.handles[0]);
+}
+
+test "dom_calls: a navigation clears a scroll region's offset instead of carrying it to the new page" {
+    // A visitor who follows a link expects the top of the new page, exactly
+    // like a browser gives them on any ordinary navigation. `reset_scroll`
+    // is how a caller tells `render` this rebuild is that kind, not a tap.
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    // First render: outer=102. The visitor scrolls it.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+
+    // A navigation to a new route: new outer=105, reset_scroll=true.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+
+    // The old offset is never read back and never written onto the new
+    // region: it is left at the browser's own default of zero for a freshly
+    // created element, exactly like following a link to any other page.
+    try std.testing.expect(!contains(rec.log.items, "readScrollOffset(102)"));
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+}
+
+test "dom_calls: a host with no scroll offset hooks still renders a scroll region" {
+    // Every existing DomOps leaves these two hooks null, the same as
+    // create_element_ns before this fix. Rendering must degrade to today's
+    // behaviour (no carried offset) rather than fail.
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var ops = rec.ops();
+    ops.read_scroll_offset = null;
+    ops.write_scroll_offset = null;
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, ops, list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+
+    // The region still builds normally.
+    try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
+    // Neither hook exists, so neither is ever called.
+    try std.testing.expect(!contains(rec.log.items, "readScrollOffset("));
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset("));
+    // The region is still remembered, so a host that gains the hooks later
+    // starts carrying its offset from the very next render.
+    try std.testing.expectEqual(@as(usize, 1), mem.count);
 }

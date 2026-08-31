@@ -12,6 +12,10 @@ pub const WebApp = struct {
     view: *phantom.View,
     ops: phantom.backend.dom_calls.DomOps,
     dispatcher: phantom.input.Dispatcher = .{},
+    /// Scroll offsets carried across a rebuild. Lives for the whole page, not
+    /// per render: `render` reads last frame's regions out of it before it
+    /// clears the DOM, then repopulates it with this frame's regions.
+    scroll_mem: phantom.backend.dom_calls.ScrollMemory = .{},
     /// Nanoseconds since the Unix epoch, from the browser's `Date.now`. This is
     /// the settable clock: NTP and a timezone edit both move it, and it can move
     /// backwards. Only a time of day is read from it. Zero until the first tick.
@@ -58,7 +62,11 @@ pub const WebApp = struct {
         ro.paint(&canvas, phantom.PhysicalOffset.zero) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
-        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink) catch |err| {
+        // Consumed once per navigation: a route change sets this before the
+        // render it causes, and this render is the only one that reads it.
+        const reset_scroll = self.owner.route_changed;
+        self.owner.route_changed = false;
+        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, reset_scroll) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
         _ = self.arena.reset(.retain_capacity);
@@ -86,6 +94,12 @@ pub const WebApp = struct {
     pub fn navigate(self: *WebApp, path: []const u8) void {
         const h = self.owner.router orelse return;
         applyLocation(h, path);
+        // Covers the case `applyLocation` cannot: a matched Back press calls
+        // `State.pop`, not `.push`/`.replace`, so nothing else sets this flag
+        // for it. Every address-bar-driven change is a navigation, so this
+        // render drops the old route's scroll offsets, the same as the two
+        // in-app paths.
+        self.owner.route_changed = true;
         self.render();
     }
 

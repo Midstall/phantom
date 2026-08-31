@@ -249,6 +249,10 @@ pub const Router = struct {
                 return;
             };
             s.sync(.push);
+            // A new route: a web render must drop any scroll offsets it
+            // carried from the old one, not hand them to whatever region
+            // happens to sit in the same creation-order slot on this page.
+            s.base.element.owner.route_changed = true;
             phantom.markNeedsBuild(s);
         }
 
@@ -268,6 +272,9 @@ pub const Router = struct {
                 return;
             };
             s.sync(.replace);
+            // See `push`: a replaced route is still a new one from the
+            // visitor's point of view, so scroll offsets do not carry over.
+            s.base.element.owner.route_changed = true;
             phantom.markNeedsBuild(s);
         }
 

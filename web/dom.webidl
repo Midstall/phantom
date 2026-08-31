@@ -5,6 +5,8 @@ interface Node {
 interface Element {
   attribute DOMString innerHTML;
   attribute DOMString textContent;
+  attribute double scrollLeft;
+  attribute double scrollTop;
   undefined setAttribute(DOMString name, DOMString value);
   Node appendChild(Node node);
 };
