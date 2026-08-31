@@ -80,33 +80,46 @@ pub fn resolveExecName(id: []const u8, exec_name: ?[]const u8) []const u8 {
     return if (last.len > 0) last else "app";
 }
 
-pub const WebRuntime = enum { auto, bun, deno, node, prebuilt };
-pub const Strategy = enum { bun, deno, prebuilt };
-pub const Avail = struct { bun: bool = false, deno: bool = false, node: bool = false };
+pub const WebRuntime = enum { auto, bun, deno, node, tsc, prebuilt };
+pub const Strategy = enum { bun, deno, tsc, prebuilt };
+pub const Avail = struct {
+    bun: bool = false,
+    deno: bool = false,
+    node: bool = false,
+    tsc: bool = false,
+    /// True when the dependency ships a committed `dist/index.js`. Most
+    /// versions do not: `npm/.gitignore` ignores `dist/`, so the default path
+    /// compiles the TypeScript source instead of copying a file that is not
+    /// there.
+    prebuilt: bool = false,
+};
 
-/// Pick the web-runtime build strategy. `.auto` uses the prebuilt multi-file copy:
-/// it is the dep's own valid ESM (no bundler), so it always works offline. The
-/// bun and deno single-file bundlers mangle this dep's pure-re-export entry (they
-/// drop the definitions and emit a nameless `export {...}`, which the browser
-/// rejects with "local binding for export 'createHost' not found"), so single-file
-/// bundling is opt-in only via an explicit .bun / .deno. An explicit runtime forces
-/// that strategy and fails if the runtime is not present.
+/// Pick the web-runtime build strategy. `.auto` copies the dependency's
+/// committed `dist` when there is one (offline, no compile step), and
+/// otherwise compiles the TypeScript source with tsc. The bun and deno
+/// single-file bundlers mangle this dep's pure-re-export entry (they drop the
+/// definitions and emit a nameless `export {...}`, which the browser rejects
+/// with "local binding for export 'createHost' not found"), so single-file
+/// bundling is opt-in only via an explicit .bun / .deno. An explicit runtime
+/// forces that strategy and fails if the runtime is not present.
 pub fn resolveStrategy(want: WebRuntime, have: Avail) error{RuntimeNotFound}!Strategy {
     return switch (want) {
-        .auto => .prebuilt,
+        .auto => if (have.prebuilt) .prebuilt else if (have.tsc) .tsc else error.RuntimeNotFound,
         .bun => if (have.bun) .bun else error.RuntimeNotFound,
         .deno => if (have.deno) .deno else error.RuntimeNotFound,
         .node => if (have.node) .prebuilt else error.RuntimeNotFound,
+        .tsc => if (have.tsc) .tsc else error.RuntimeNotFound,
         .prebuilt => .prebuilt,
     };
 }
 
 /// The HTML module import path for a strategy: single-file for bun/deno, the
-/// multi-file dist index for the prebuilt copy.
+/// multi-file dist index for tsc and the prebuilt copy (tsc's `--outDir`
+/// mirrors the prebuilt layout, so the page needs no strategy-specific case).
 pub fn importPathFor(s: Strategy) []const u8 {
     return switch (s) {
         .bun, .deno => "./webidl-runtime.js",
-        .prebuilt => "./webidl-runtime/index.js",
+        .tsc, .prebuilt => "./webidl-runtime/index.js",
     };
 }
 
@@ -332,11 +345,14 @@ test "metainfoXml developer id is the vendor domain, not the app id" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "<developer id=\"org.example.phantom\">") != null);
 }
 
-test "resolveStrategy: auto always uses the prebuilt copy (bundlers mangle the dep)" {
-    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{ .bun = true, .deno = true, .node = true }));
-    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{ .deno = true, .node = true }));
-    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{ .node = true }));
-    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{}));
+test "resolveStrategy: auto prefers the committed dist and falls back to tsc" {
+    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{ .bun = true, .deno = true, .node = true, .prebuilt = true }));
+    try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.auto, .{ .deno = true, .node = true, .prebuilt = true }));
+    // No committed dist: auto falls back to compiling with tsc.
+    try std.testing.expectEqual(Strategy.tsc, try resolveStrategy(.auto, .{ .node = true, .tsc = true }));
+    try std.testing.expectEqual(Strategy.tsc, try resolveStrategy(.auto, .{ .tsc = true }));
+    // Neither the dist nor tsc is available: auto has nothing to build with.
+    try std.testing.expectError(error.RuntimeNotFound, resolveStrategy(.auto, .{}));
 }
 
 test "resolveStrategy: explicit forces and errors if the runtime is absent" {
@@ -347,6 +363,8 @@ test "resolveStrategy: explicit forces and errors if the runtime is absent" {
     // node uses the prebuilt copy for the build, but requires node to be present
     try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.node, .{ .node = true }));
     try std.testing.expectError(error.RuntimeNotFound, resolveStrategy(.node, .{}));
+    try std.testing.expectEqual(Strategy.tsc, try resolveStrategy(.tsc, .{ .tsc = true }));
+    try std.testing.expectError(error.RuntimeNotFound, resolveStrategy(.tsc, .{}));
     // prebuilt always succeeds
     try std.testing.expectEqual(Strategy.prebuilt, try resolveStrategy(.prebuilt, .{}));
 }
@@ -354,6 +372,7 @@ test "resolveStrategy: explicit forces and errors if the runtime is absent" {
 test "importPathFor: single-file vs multi-file" {
     try std.testing.expectEqualStrings("./webidl-runtime.js", importPathFor(.bun));
     try std.testing.expectEqualStrings("./webidl-runtime.js", importPathFor(.deno));
+    try std.testing.expectEqualStrings("./webidl-runtime/index.js", importPathFor(.tsc));
     try std.testing.expectEqualStrings("./webidl-runtime/index.js", importPathFor(.prebuilt));
 }
 

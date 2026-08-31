@@ -237,13 +237,21 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     wasm.root_module.addImport("dom", dom_client);
     wasm.root_module.addImport("app_root", app_mod);
 
-    // Offline JS runtime strategy (detected at build time, no network access):
+    // JS runtime strategy (detected at build time):
     //
-    // prebuilt -> copy npm/webidl-runtime/dist/ (multi-file ESM, committed in the
-    //             webidl dep) to dist/{id}/webidl-runtime/
+    // prebuilt -> copy npm/webidl-runtime/dist/ (multi-file ESM) to
+    //             dist/{id}/webidl-runtime/
     //             HTML imports: "./webidl-runtime/index.js"
-    //             This is the DEFAULT (.auto): it is the dep's own valid ESM, so it
-    //             always works with no bundler.
+    //             The webidl dep's npm/.gitignore ignores dist/, so most
+    //             checkouts of the dep do NOT commit this directory. Use this
+    //             path only when a dist/index.js is actually present.
+    //
+    // tsc      -> compile npm/webidl-runtime/src/*.ts (multi-file ESM) to an
+    //             output directory the build owns, then install it to
+    //             dist/{id}/webidl-runtime/
+    //             HTML imports: "./webidl-runtime/index.js"
+    //             This is the DEFAULT (.auto) when the dep has no committed
+    //             dist/index.js. It needs no network access, only tsc on PATH.
     //
     // bun      -> bun build --format esm --entrypoints dist/index.js (opt-in only)
     //             single-file -> dist/{id}/webidl-runtime.js
@@ -254,9 +262,10 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     //             nameless `export {...}`, which the browser rejects). Use only if
     //             your bundler is verified to produce a valid module.
     //
-    // When opts.web_runtime is .auto the build uses prebuilt (reliable, offline).
-    // Explicit .bun / .deno pin single-file bundling; an unavailable runtime
-    // injects a build-time failure step (the wasm is still compiled).
+    // When opts.web_runtime is .auto the build prefers a committed prebuilt
+    // dist and falls back to compiling with tsc when there is none. Explicit
+    // .bun / .deno / .tsc pin that strategy; an unavailable tool injects a
+    // build-time failure step that names the tool (the wasm is still compiled).
 
     const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (web)", .{opts.id}));
 
@@ -397,15 +406,29 @@ fn addRuntimeToStep(
     step: *std.Build.Step,
     runtime: appmeta.WebRuntime,
 ) []const u8 {
+    // The committed dist is the exception, not the rule: npm/.gitignore ignores
+    // dist/, so most checkouts of the dep have none. Check the real filesystem
+    // rather than assume, because a later version of the dep may commit it, and
+    // then the copy is both faster and offline.
+    const dist_index = webidl_dep.builder.pathFromRoot("npm/webidl-runtime/dist/index.js");
+    const has_prebuilt = blk: {
+        std.Io.Dir.accessAbsolute(b.graph.io, dist_index, .{}) catch break :blk false;
+        break :blk true;
+    };
     const have = appmeta.Avail{
         .bun = (b.findProgram(&.{"bun"}, &.{}) catch null) != null,
         .deno = (b.findProgram(&.{"deno"}, &.{}) catch null) != null,
         .node = (b.findProgram(&.{"node"}, &.{}) catch null) != null,
+        .tsc = (b.findProgram(&.{"tsc"}, &.{}) catch null) != null,
+        .prebuilt = has_prebuilt,
     };
     const strategy = appmeta.resolveStrategy(runtime, have) catch {
+        // .auto tries the committed dist first and falls back to tsc, so an
+        // unresolved .auto always means tsc is the missing tool.
+        const missing_tool: []const u8 = if (runtime == .auto) "tsc" else @tagName(runtime);
         step.dependOn(&b.addFail(b.fmt(
-            "phantom.addApp: web_runtime .{s} requested but that runtime was not found in PATH",
-            .{@tagName(runtime)},
+            "phantom.addApp: the web target needs {s}, but it was not found in PATH",
+            .{missing_tool},
         )).step);
         return appmeta.importPathFor(.prebuilt);
     };
@@ -430,6 +453,42 @@ fn addRuntimeToStep(
             run.addArg("--output");
             const js_lp = run.addOutputFileArg("webidl-runtime.js");
             step.dependOn(&b.addInstallFile(js_lp, b.fmt("{s}/webidl-runtime.js", .{dist_dir})).step);
+        },
+        .tsc => {
+            // Compile the TS source directly (not the missing dist): --outDir
+            // goes to a path the build owns, because the package cache is read
+            // only. --rewriteRelativeImportExtensions turns the sources' explicit
+            // `.ts` imports into `.js`, which is what the browser needs to load
+            // the emitted module graph; it needs TypeScript 5.7 or newer.
+            // node-fs.d.ts is an ambient declaration for `node:fs/promises`
+            // (loader.ts's non-browser file-read path); it emits no JS but is
+            // required for the type check to pass.
+            const run = b.addSystemCommand(&.{
+                (b.findProgram(&.{"tsc"}, &.{}) catch unreachable),
+                "--target",
+                "ES2022",
+                "--module",
+                "ES2022",
+                "--moduleResolution",
+                "bundler",
+                "--rewriteRelativeImportExtensions",
+                "--strict",
+                "--declaration",
+                "false",
+                "--outDir",
+            });
+            const out_dir = run.addOutputDirectoryArg("webidl-runtime");
+            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/abi.ts"));
+            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/host.ts"));
+            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/index.ts"));
+            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/loader.ts"));
+            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/node-fs.d.ts"));
+            step.dependOn(&b.addInstallDirectory(.{
+                .source_dir = out_dir,
+                .install_dir = .prefix,
+                .install_subdir = b.fmt("{s}/webidl-runtime", .{dist_dir}),
+                .include_extensions = &.{".js"},
+            }).step);
         },
         .prebuilt => {
             step.dependOn(&b.addInstallDirectory(.{

@@ -62,6 +62,7 @@
               zig
               bun
               nodejs
+              typescript
             ];
           };
         }
