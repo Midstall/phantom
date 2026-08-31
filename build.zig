@@ -392,21 +392,27 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     return step;
 }
 
-// Inline static server scripts. Each serves a directory on port 8080. All three
-// read the dir from the PHANTOM_SERVE_DIR env var (node/bun `-e` eval mode does not
-// expose a positional arg at a stable argv index, so an env var is used uniformly).
+// Inline static server scripts. Each serves a directory on port 8080, bound to
+// loopback only: this is a dev server, and a request path is remote input, not
+// something to trust. All three read the dir from the PHANTOM_SERVE_DIR env var
+// (node/bun `-e` eval mode does not expose a positional arg at a stable argv
+// index, so an env var is used uniformly).
 // Content-Type: .wasm -> application/wasm, .js -> text/javascript,
 // .html -> text/html, anything else -> application/octet-stream.
 // A path with no file extension is a route, not a file, so it maps to that
 // path's own index.html. This mirrors the prerendered copies addWebApp
 // writes for the .path url strategy, so a browser refresh on a route works
 // on the dev server the same way it works on a static host.
+// Each script resolves the request against the served root and refuses a
+// path that escapes it (a "../" walk answers 404), so a client cannot read
+// files elsewhere on the developer's disk.
 const node_serve_js =
     \\const http = require('http');
     \\const fs = require('fs');
     \\const path = require('path');
     \\const dir = process.env.PHANTOM_SERVE_DIR;
     \\if (!dir) { process.stderr.write('PHANTOM_SERVE_DIR not set\n'); process.exit(1); }
+    \\const root = path.resolve(dir);
     \\function mime(p) {
     \\  if (p.endsWith('.wasm')) return 'application/wasm';
     \\  if (p.endsWith('.js')) return 'text/javascript';
@@ -414,17 +420,23 @@ const node_serve_js =
     \\  return 'application/octet-stream';
     \\}
     \\http.createServer(function(req, res) {
-    \\  let pathname = req.url.split('?')[0];
+    \\  let pathname;
+    \\  try { pathname = decodeURIComponent(req.url.split('?')[0]); } catch { pathname = req.url.split('?')[0]; }
     \\  if (pathname === '/') pathname = '/index.html';
     \\  else if (!path.extname(pathname)) pathname += '/index.html';
-    \\  let file = path.join(dir, pathname);
+    \\  const file = path.join(root, pathname);
     \\  process.stdout.write(req.method + ' ' + req.url + '\n');
+    \\  if (file !== root && !file.startsWith(root + path.sep)) {
+    \\    res.writeHead(404);
+    \\    res.end('not found');
+    \\    return;
+    \\  }
     \\  fs.readFile(file, function(err, data) {
     \\    if (err) { res.writeHead(404); res.end('not found'); return; }
     \\    res.writeHead(200, { 'Content-Type': mime(file) });
     \\    res.end(data);
     \\  });
-    \\}).listen(8080, function() {
+    \\}).listen(8080, '127.0.0.1', function() {
     \\  process.stdout.write('phantom serve: http://localhost:8080 serving ' + dir + '\n');
     \\});
 ;
@@ -432,6 +444,8 @@ const node_serve_js =
 const bun_serve_js =
     \\const dir = process.env.PHANTOM_SERVE_DIR;
     \\if (!dir) { process.stderr.write('PHANTOM_SERVE_DIR not set\n'); process.exit(1); }
+    \\const path = require('path');
+    \\const root = path.resolve(dir);
     \\function mime(p) {
     \\  if (p.endsWith('.wasm')) return 'application/wasm';
     \\  if (p.endsWith('.js')) return 'text/javascript';
@@ -440,12 +454,16 @@ const bun_serve_js =
     \\}
     \\const server = Bun.serve({
     \\  port: 8080,
+    \\  hostname: '127.0.0.1',
     \\  async fetch(req) {
     \\    const url = new URL(req.url);
     \\    let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
     \\    if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
-    \\    const file = dir + pathname;
+    \\    const file = path.join(root, pathname);
     \\    console.log(req.method + ' ' + url.pathname);
+    \\    if (file !== root && !file.startsWith(root + path.sep)) {
+    \\      return new Response('not found', { status: 404 });
+    \\    }
     \\    const f = Bun.file(file);
     \\    if (!(await f.exists())) return new Response('not found', { status: 404 });
     \\    return new Response(f, { headers: { 'Content-Type': mime(file) } });
@@ -455,20 +473,25 @@ const bun_serve_js =
 ;
 
 const deno_serve_js =
+    \\import { join, resolve, sep } from 'node:path';
     \\const dir = Deno.env.get('PHANTOM_SERVE_DIR');
     \\if (!dir) { console.error('PHANTOM_SERVE_DIR not set'); Deno.exit(1); }
+    \\const root = resolve(dir);
     \\function mime(p) {
     \\  if (p.endsWith('.wasm')) return 'application/wasm';
     \\  if (p.endsWith('.js')) return 'text/javascript';
     \\  if (p.endsWith('.html')) return 'text/html';
     \\  return 'application/octet-stream';
     \\}
-    \\Deno.serve({ port: 8080 }, async function(req) {
+    \\Deno.serve({ port: 8080, hostname: '127.0.0.1' }, async function(req) {
     \\  const url = new URL(req.url);
     \\  let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
     \\  if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
-    \\  const file = dir + pathname;
+    \\  const file = join(root, pathname);
     \\  console.log(req.method + ' ' + url.pathname);
+    \\  if (file !== root && !file.startsWith(root + sep)) {
+    \\    return new Response('not found', { status: 404 });
+    \\  }
     \\  try {
     \\    const data = await Deno.readFile(file);
     \\    return new Response(data, { headers: { 'Content-Type': mime(file) } });
