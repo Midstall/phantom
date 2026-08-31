@@ -73,7 +73,23 @@ pub const AppOptions = struct {
     /// Paths that get their own copy of the page, so a refresh works on a static
     /// host. Only read with the `.path` strategy. `/` is always written.
     prerender_routes: []const []const u8 = &.{},
+    /// The site root the generated page's assets resolve against, emitted as
+    /// `<base href="...">`. A prerendered copy is reachable as both
+    /// "/gallery" and "/gallery/", and a browser resolves a relative URL
+    /// differently for each, so no relative prefix works for both; a fixed
+    /// base does. Set this when the site is hosted under a subdirectory.
+    /// Must start and end with '/'. Validate with `validateBasePath`.
+    base_path: []const u8 = "/",
 };
+
+/// Check a `base_path`: it must start and end with '/', so a relative asset
+/// URL always resolves from the site root. A caller passes a bad value only
+/// by mistake, so build.zig turns this into a loud build failure rather than
+/// installing a subtly broken site.
+pub fn validateBasePath(base_path: []const u8) error{InvalidBasePath}!void {
+    if (base_path.len == 0) return error.InvalidBasePath;
+    if (base_path[0] != '/' or base_path[base_path.len - 1] != '/') return error.InvalidBasePath;
+}
 
 /// The binary name for an app. Borrows both arguments and returns a slice into
 /// one of them, so the result lives exactly as long as its input.
@@ -391,6 +407,17 @@ test "resolveExecName falls back to the last dotted segment of the id" {
 
 test "resolveExecName prefers an explicit exec_name over the id" {
     try std.testing.expectEqualStrings("genesis-shell", resolveExecName("com.expidusos.genesis", "genesis-shell"));
+}
+
+test "validateBasePath accepts a root or subdirectory base" {
+    try validateBasePath("/");
+    try validateBasePath("/docs/");
+}
+
+test "validateBasePath rejects a base missing a leading or trailing slash" {
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath(""));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("docs/"));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("/docs"));
 }
 
 test "resolveExecName rejects an id with a trailing dot rather than returning empty" {

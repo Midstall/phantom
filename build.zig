@@ -95,6 +95,16 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
 }
 
 fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
+    // A wrong base_path is a caller mistake, not a runtime fault: fail the
+    // build now with a message that says what was expected, rather than
+    // install a page whose assets resolve to the wrong place.
+    appmeta.validateBasePath(opts.base_path) catch {
+        return &b.addFail(b.fmt(
+            "phantom.addApp: base_path must start and end with '/', got \"{s}\"",
+            .{opts.base_path},
+        )).step;
+    };
+
     const wasm_name = execName(b, opts.id, opts.exec_name);
     const dist_dir = b.fmt("dist/{s}", .{opts.id});
 
@@ -354,7 +364,7 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // Build + install the webidl-runtime JS and generate a matching index.html.
     const runtime_import = addRuntimeToStep(b, webidl_dep, dist_dir, step, opts.web_runtime);
 
-    const html_src = buildIndexHtml(b, wasm_name, runtime_import);
+    const html_src = buildIndexHtml(b, wasm_name, runtime_import, opts.base_path);
     const html_lp = b.addWriteFiles().add("index.html", html_src);
     step.dependOn(&b.addInstallFile(html_lp, b.fmt("{s}/index.html", .{dist_dir})).step);
 
@@ -636,13 +646,18 @@ fn addRuntimeToStep(
     return appmeta.importPathFor(strategy);
 }
 
-/// Generate a minimal index.html for the web app bundle.
-fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const u8) []const u8 {
+/// Generate a minimal index.html for the web app bundle. `base_path` fixes
+/// where a relative asset resolves from: the same file is reachable as both
+/// "/gallery" and "/gallery/", and a browser resolves "./x" differently for
+/// each, so the page cannot rely on the request's shape and needs an
+/// explicit <base> instead.
+fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const u8, base_path: []const u8) []const u8 {
     return b.fmt(
         \\<!doctype html>
         \\<html>
         \\  <head>
         \\    <meta charset="utf-8" />
+        \\    <base href="{s}" />
         \\    <title>{s}</title>
         \\  </head>
         \\  <body>
@@ -679,7 +694,7 @@ fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const 
         \\    </script>
         \\  </body>
         \\</html>
-    , .{ wasm_name, runtime_import, wasm_name });
+    , .{ base_path, wasm_name, runtime_import, wasm_name });
 }
 
 fn execName(b: *std.Build, id: []const u8, exec_name: ?[]const u8) []const u8 {
