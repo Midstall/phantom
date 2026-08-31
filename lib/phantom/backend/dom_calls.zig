@@ -304,7 +304,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 }
             } else unreachable;
             var tbuf: [8]u8 = undefined;
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, font_idx, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
+            // `white-space:pre` because this framework already decided where
+            // every line breaks and how wide each run is. Without it a browser
+            // applies its own rules to the run: it collapses each stretch of
+            // spaces to one, drops the leading spaces of a line, and may break
+            // the run again at a width of its own choosing. Indented source in
+            // a code block loses its indentation to exactly that.
+            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, font_idx, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
             defer gpa.free(style);
             const node = ops.createElement("div");
             ops.setAttribute(node, "style", style);
@@ -1003,4 +1009,26 @@ test "dom_calls: image fromRgba (no encoded bytes) emits no img element" {
     try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // No img element should be created (fromRgba has no encoded bytes).
     try std.testing.expect(!contains(rec.log.items, "createElement(img)"));
+}
+
+test "a text run keeps its own spacing instead of letting the browser collapse it" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+
+    var h = try @import("../testing.zig").mount(gpa, blk: {
+        const t = @import("../widgets/text.zig").Text{ .text = "    indented", .size = 16 };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    try h.pump();
+
+    try render(gpa, rec.ops(), h.canvas.list, .{ .width = 200, .height = 100 }, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, null);
+
+    // Without this rule a browser drops the leading spaces of a run and
+    // collapses every other stretch of them, so indented source loses its
+    // shape. This framework already placed the run, so the browser must not
+    // re-space it.
+    try std.testing.expect(contains(rec.log.items, "white-space:pre"));
+    try std.testing.expect(contains(rec.log.items, "    indented"));
 }
