@@ -15,6 +15,15 @@ Linux gets all three backends. Every other native target gets the terminal
 backend only, because the GPU path depends on lattice and prism, and those
 build for Linux today.
 
+**Clip and scroll regions nest on every backend.** A `ClipRRect` inside a
+`ScrollView`, a `ScrollView` inside another `ScrollView`, and a `GridView`
+inside either (`GridView` opens a scroll region of its own) all paint into
+the right region, at the right depth. On the DOM backend, each level of
+nesting is a real stack: a pop restores the exact parent element and
+coordinate origin its matching push saved. The stack holds up to 32 open
+regions; a display list that nests deeper than that skips the extra region
+and reports a fault rather than mispositioning the rest of the frame.
+
 **macOS and Windows are cross compiled, not tested.** The terminal backend
 follows the same specification as the Linux terminal path, but nobody has run
 it on a real Mac or a real Windows machine. Treat those two targets as

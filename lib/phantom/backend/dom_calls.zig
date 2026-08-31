@@ -7,6 +7,7 @@ const image_mod = @import("../image/Image.zig");
 const icon_builtin = @import("../icon/builtin.zig");
 const svg_path = @import("../icon/svg_path.zig");
 const platform = @import("../platform.zig");
+const FaultSink = @import("../FaultSink.zig");
 
 /// The namespace an `<svg>` and its children must be created in. `createElement`
 /// puts an element in the HTML namespace whatever its name is, and an `svg` in
@@ -83,8 +84,25 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
     return buf.toOwnedSlice(gpa);
 }
 
-/// Rebuild the whole document body's child tree from the display list.
-pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color) !void {
+/// How many clip/scroll regions can nest before `render` refuses to open any
+/// more and reports a fault instead of corrupting the frame. A real page nests
+/// a handful of regions at most; this catches a runaway or malformed display
+/// list rather than reading or writing past a fixed stack.
+pub const max_region_depth = 32;
+
+/// One open clip or scroll region: the append target and coordinate origin its
+/// matching push saw before it changed them. A pop restores exactly this, so a
+/// region nested inside another one cannot leak its coordinates into whatever
+/// comes after it.
+const RegionFrame = struct {
+    parent: u32,
+    origin: ?geometry.PhysicalOffset,
+};
+
+/// Rebuild the whole document body's child tree from the display list. `sink`
+/// records a fault when the display list nests more clip/scroll regions than
+/// `max_region_depth`; pass null where no sink is wired up.
+pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink) !void {
     ops.clearChildren(ops.body);
 
     // Collect distinct fonts once; used for text primitive font-family index lookups.
@@ -100,10 +118,17 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     }
     ops.appendChild(ops.body, container);
 
-    // parent is where children append (the container, or a scroll region inner div).
-    // region_origin subtracts the scroll viewport origin from child coords (v1 single level).
+    // parent is where children append (the container, or a scroll/clip region's
+    // inner div). region_origin subtracts the region's own origin from child
+    // coords. Regions nest, so `region_stack` keeps every open one's parent and
+    // origin, and each pop restores exactly the frame its push saved.
     var parent: u32 = container;
     var region_origin: ?geometry.PhysicalOffset = null;
+    var region_stack: [max_region_depth]RegionFrame = undefined;
+    var region_depth: usize = 0;
+    // Opens refused past `max_region_depth`, so a later pop can tell it was
+    // never recorded and must not touch `region_stack`.
+    var region_skipped: usize = 0;
 
     // Accumulate :hover/:active rules for interactive rrects; injected as a <style> after the loop.
     var rules: std.ArrayList(u8) = .empty;
@@ -281,42 +306,87 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             ops.appendChild(parent, node);
         },
         .push_scroll => |sr| {
-            // Outer div: clipping/scrolling window at the viewport position and size.
-            const outer_style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x, sr.viewport.y, sr.viewport.width, sr.viewport.height });
-            defer gpa.free(outer_style);
-            const outer = ops.createElement("div");
-            ops.setAttribute(outer, "style", outer_style);
-            ops.appendChild(parent, outer);
-            // Inner div: the full content area that scrolls inside the outer.
-            const inner_style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
-            defer gpa.free(inner_style);
-            const inner = ops.createElement("div");
-            ops.setAttribute(inner, "style", inner_style);
-            ops.appendChild(outer, inner);
-            // Children now append to the inner div; coords subtract the viewport origin.
-            parent = inner;
-            region_origin = .{ .x = sr.viewport.x, .y = sr.viewport.y };
+            if (region_depth >= max_region_depth) {
+                region_skipped += 1;
+                if (sink) |s| s.report(.region_overflow, "scroll region nesting exceeded max_region_depth, region skipped");
+            } else {
+                const ox: f32 = if (region_origin) |o| o.x else 0;
+                const oy: f32 = if (region_origin) |o| o.y else 0;
+                // Outer div: clipping/scrolling window at the viewport position and
+                // size, relative to whatever region this one is nested inside.
+                const outer_style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
+                defer gpa.free(outer_style);
+                const outer = ops.createElement("div");
+                ops.setAttribute(outer, "style", outer_style);
+                ops.appendChild(parent, outer);
+                // Inner div: the full content area that scrolls inside the outer.
+                const inner_style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
+                defer gpa.free(inner_style);
+                const inner = ops.createElement("div");
+                ops.setAttribute(inner, "style", inner_style);
+                ops.appendChild(outer, inner);
+                // Children now append to the inner div; coords subtract the
+                // viewport origin. The frame this push saw goes on the stack, so
+                // the matching pop restores exactly it and not the top level.
+                region_stack[region_depth] = .{ .parent = parent, .origin = region_origin };
+                region_depth += 1;
+                parent = inner;
+                region_origin = .{ .x = sr.viewport.x, .y = sr.viewport.y };
+            }
         },
         .pop_scroll => {
-            // Restore the top-level container as the append target.
-            parent = container;
-            region_origin = null;
+            if (region_skipped > 0) {
+                // This pop matches a push that was refused for depth, not one
+                // that opened a region, so there is no frame to restore.
+                region_skipped -= 1;
+            } else if (region_depth > 0) {
+                region_depth -= 1;
+                const frame = region_stack[region_depth];
+                parent = frame.parent;
+                region_origin = frame.origin;
+            } else {
+                // A pop with no matching push is a malformed display list, a
+                // runtime fault and not a programmer error, so it falls back to
+                // the top level rather than reading before an empty stack.
+                parent = container;
+                region_origin = null;
+            }
         },
         .push_clip => |cr| {
-            // A browser clips to the full rounded shape, so this backend is the
-            // one that honours the radius exactly.
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x, cr.rect.y, cr.rect.width, cr.rect.height, cr.radius });
-            defer gpa.free(style);
-            const node = ops.createElement("div");
-            ops.setAttribute(node, "style", style);
-            ops.appendChild(parent, node);
-            // Children now append inside the clip; coords subtract its origin.
-            parent = node;
-            region_origin = .{ .x = cr.rect.x, .y = cr.rect.y };
+            if (region_depth >= max_region_depth) {
+                region_skipped += 1;
+                if (sink) |s| s.report(.region_overflow, "clip region nesting exceeded max_region_depth, region skipped");
+            } else {
+                const ox: f32 = if (region_origin) |o| o.x else 0;
+                const oy: f32 = if (region_origin) |o| o.y else 0;
+                // A browser clips to the full rounded shape, so this backend is
+                // the one that honours the radius exactly. Positioned relative to
+                // whatever region this clip is nested inside, like every other
+                // primitive here.
+                const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
+                defer gpa.free(style);
+                const node = ops.createElement("div");
+                ops.setAttribute(node, "style", style);
+                ops.appendChild(parent, node);
+                // Children now append inside the clip; coords subtract its origin.
+                region_stack[region_depth] = .{ .parent = parent, .origin = region_origin };
+                region_depth += 1;
+                parent = node;
+                region_origin = .{ .x = cr.rect.x, .y = cr.rect.y };
+            }
         },
         .pop_clip => {
-            parent = container;
-            region_origin = null;
+            if (region_skipped > 0) {
+                region_skipped -= 1;
+            } else if (region_depth > 0) {
+                region_depth -= 1;
+                const frame = region_stack[region_depth];
+                parent = frame.parent;
+                region_origin = frame.origin;
+            } else {
+                parent = container;
+                region_origin = null;
+            }
         },
     };
 
@@ -459,7 +529,7 @@ test "dom_calls: fill rrect creates a styled div appended to the container" {
         .radius = 4,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // clears body, builds the container, then the rrect div with the right style + append.
     try std.testing.expect(contains(rec.log.items, "clearChildren(1)"));
     try std.testing.expect(contains(rec.log.items, "position:relative;width:200px"));
@@ -483,7 +553,7 @@ test "dom_calls: text primitive records setTextContent with raw string and font-
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = geometry.PhysicalOffset{ .x = 5, .y = 8 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // The raw string is passed directly (browser handles escaping).
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "<b>hi</b>"));
     // The style div must carry font-family:pf0.
@@ -502,7 +572,7 @@ test "dom_calls: stroke rrect records a border:...solid rgba style" {
         .color = geometry.Color.rgb(0, 1, 0),
         .stroke_width = 2,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // Must have border-radius, box-sizing, and the border solid rgba style.
     try std.testing.expect(contains(rec.log.items, "box-sizing:border-box"));
     try std.testing.expect(contains(rec.log.items, "border:2px solid rgba("));
@@ -522,7 +592,7 @@ test "dom_calls: interactive fill rrect records class=pb0 and a style element wi
         .hover_color = geometry.Color.rgb(0, 0, 0.9),
         .active_color = geometry.Color.rgb(0, 0, 0.8),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // The div must carry class="pb0" via setAttribute.
     try std.testing.expect(contains(rec.log.items, "setAttribute(") and contains(rec.log.items, "class,pb0"));
     // A style element must be created and its textContent must contain the hover rule.
@@ -548,7 +618,7 @@ test "an interactive rectangle gets a pointer cursor and a plain one does not" {
         .radius = 0,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     try std.testing.expect(contains(rec.log.items, ".pb0{cursor:pointer}"));
     try std.testing.expect(!contains(rec.log.items, ".pb1"));
 }
@@ -581,7 +651,7 @@ test "dom_calls: a wrapped paragraph's three text runs each set a different line
         } });
         y += l.height;
     }
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
 
     // Three distinct setTextContent calls, one per line, exactly matching the
     // line each was drawn for.
@@ -612,7 +682,7 @@ test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" 
         .color = geometry.Color.rgb(1, 0, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
     // Outer div has overflow:scroll and the viewport position/size.
     try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
     try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:100px;height:50px;overflow:scroll"));
@@ -620,6 +690,147 @@ test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" 
     try std.testing.expect(contains(rec.log.items, "position:relative;width:100px;height:300px"));
     // The rrect is appended to the inner div with adjusted coords: left=0 (10-10), top=100 (120-20).
     try std.testing.expect(contains(rec.log.items, "left:0px;top:100px"));
+}
+
+test "dom_calls: a clip nested in a scroll positions itself relative to the scroll's origin, not the canvas" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 10, .y = 20, .width = 100, .height = 100 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+    } });
+    // Clip at absolute x=30,y=50: nested inside the scroll, so its own div must
+    // sit at (30-10, 50-20) relative to the scroll's inner div, not at (30,50).
+    try list.append(gpa, .{ .push_clip = .{
+        .rect = geometry.PhysicalRect{ .x = 30, .y = 50, .width = 40, .height = 40 },
+        .radius = 0,
+    } });
+    try list.append(gpa, .{ .pop_clip = {} });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
+    try std.testing.expect(contains(rec.log.items, "left:20px;top:30px;width:40px;height:40px"));
+    // The un-adjusted absolute position must not appear: that would place the
+    // clip twice as far from the scroll's own corner as it should be.
+    try std.testing.expect(!contains(rec.log.items, "left:30px;top:50px;width:40px;height:40px"));
+}
+
+test "dom_calls: after a clip inside a scroll pops, later primitives return to the scroll's own div and origin" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 10, .y = 20, .width = 100, .height = 100 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+    } });
+    try list.append(gpa, .{ .push_clip = .{
+        .rect = geometry.PhysicalRect{ .x = 5, .y = 5, .width = 50, .height = 50 },
+        .radius = 0,
+    } });
+    try list.append(gpa, .{ .rrect = .{
+        .rect = geometry.PhysicalRect{ .x = 10, .y = 10, .width = 8, .height = 8 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+    } });
+    try list.append(gpa, .{ .pop_clip = {} });
+    // After the clip pops, this rrect is still inside the scroll: it must
+    // append to the scroll's inner div (handle 103, not the container) and use
+    // the scroll's origin (10,20), not the clip's or the canvas's absolute one.
+    try list.append(gpa, .{ .rrect = .{
+        .rect = geometry.PhysicalRect{ .x = 15, .y = 25, .width = 9, .height = 9 },
+        .radius = 0,
+        .color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null);
+    // container=101, scroll outer=102, scroll inner=103, clip div=104, first
+    // rrect div=105, second rrect div=106.
+    try std.testing.expect(contains(rec.log.items, "appendChild(103,106)"));
+    try std.testing.expect(!contains(rec.log.items, "appendChild(101,106)"));
+    try std.testing.expect(contains(rec.log.items, "left:5px;top:5px;width:9px;height:9px"));
+}
+
+test "dom_calls: after a scroll nested inside another scroll pops, later primitives return to the outer scroll's div and origin" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 10, .y = 20, .width = 200, .height = 200 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 200, .height = 400 },
+    } });
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 30, .y = 40, .width = 50, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 50, .height = 150 },
+    } });
+    try list.append(gpa, .{ .rrect = .{
+        .rect = geometry.PhysicalRect{ .x = 35, .y = 45, .width = 6, .height = 6 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    // After the inner scroll pops, this rrect is still inside the outer one: it
+    // must append to the outer's inner div (handle 103) with the outer's origin
+    // (10,20), not the container with the inner scroll's or no origin at all.
+    try list.append(gpa, .{ .rrect = .{
+        .rect = geometry.PhysicalRect{ .x = 15, .y = 25, .width = 7, .height = 7 },
+        .radius = 0,
+        .color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 500 }, geometry.Color.rgb(0, 0, 0), null);
+    // container=101, outer scroll outer/inner=102/103, inner scroll outer/inner=104/105,
+    // first rrect div=106, second rrect div=107.
+    try std.testing.expect(contains(rec.log.items, "appendChild(103,107)"));
+    try std.testing.expect(!contains(rec.log.items, "appendChild(101,107)"));
+    try std.testing.expect(contains(rec.log.items, "left:5px;top:5px;width:7px;height:7px"));
+}
+
+test "dom_calls: a region nested past max_region_depth is skipped and reports a fault, without breaking the pops that follow" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var sink = FaultSink{};
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    // One more push than the cap allows.
+    var i: usize = 0;
+    while (i < max_region_depth + 1) : (i += 1) {
+        try list.append(gpa, .{ .push_clip = .{
+            .rect = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 10, .height = 10 },
+            .radius = 0,
+        } });
+    }
+    i = 0;
+    while (i < max_region_depth + 1) : (i += 1) {
+        try list.append(gpa, .{ .pop_clip = {} });
+    }
+    // One more primitive after every push/pop balances out, to prove the stack
+    // ended up back at the container rather than corrupted by the overflow.
+    try list.append(gpa, .{ .rrect = .{
+        .rect = geometry.PhysicalRect{ .x = 1, .y = 2, .width = 3, .height = 4 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+    } });
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), &sink);
+    try std.testing.expect(!sink.ok());
+    try std.testing.expectEqual(FaultSink.FaultCode.region_overflow, sink.first.?.code);
+    // container=101, then one div per honoured push (max_region_depth of them,
+    // handles 102..133); the refused push creates nothing. The trailing rrect's
+    // div is handle 134 and must append to the container: every honoured push
+    // was correctly unwound and the one refused push left nothing dangling for
+    // its matching pop to (mis)restore.
+    try std.testing.expect(contains(rec.log.items, "appendChild(101,134)"));
+    try std.testing.expect(contains(rec.log.items, "left:1px;top:2px;width:3px;height:4px"));
 }
 
 test "dom_calls: image with encoded bytes emits createElement(img), style, and data URL src" {
@@ -636,7 +847,7 @@ test "dom_calls: image with encoded bytes emits createElement(img), style, and d
         .rect = .{ .x = 5, .y = 15, .width = 64, .height = 32 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // A createElement("img") call must be recorded.
     try std.testing.expect(contains(rec.log.items, "createElement(img)"));
     // The style attribute must include left/top/width/height.
@@ -680,7 +891,7 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
         .color = geometry.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
 
     // createElement("svg") builds an HTML unknown element that never paints, so
     // the namespaced call is the fact this pins.
@@ -716,7 +927,7 @@ test "dom_calls: a labelled icon appends a namespaced title node holding the nam
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
 
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,title)"));
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "Genesis"));
@@ -741,7 +952,7 @@ test "dom_calls: an icon with no label creates no title node" {
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     try std.testing.expect(!contains(rec.log.items, ",title)"));
     // The svg is still built, so this is not passing because nothing was drawn.
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,path)"));
@@ -764,7 +975,7 @@ test "dom_calls: a host with no namespaced creator still builds the icon through
     } });
     var ops = rec.ops();
     ops.create_element_ns = null;
-    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     try std.testing.expect(contains(rec.log.items, "createElement(svg)"));
     try std.testing.expect(contains(rec.log.items, "createElement(path)"));
     try std.testing.expect(!contains(rec.log.items, "createElementNS("));
@@ -783,7 +994,7 @@ test "dom_calls: image fromRgba (no encoded bytes) emits no img element" {
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null);
     // No img element should be created (fromRgba has no encoded bytes).
     try std.testing.expect(!contains(rec.log.items, "createElement(img)"));
 }

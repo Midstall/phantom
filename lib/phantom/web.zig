@@ -58,7 +58,7 @@ pub const WebApp = struct {
         ro.paint(&canvas, phantom.PhysicalOffset.zero) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
-        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg) catch |err| {
+        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
         _ = self.arena.reset(.retain_capacity);

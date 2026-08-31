@@ -27,6 +27,10 @@ pub const FaultCode = enum {
     /// read is refused rather than truncated, because a truncated address is
     /// a different, shorter route than the one the user is actually on.
     location_too_long,
+    /// A clip or scroll region nested deeper than the backend can track. The
+    /// region past the limit is not opened, so content painted inside it lands
+    /// in its parent's space instead of a silently wrong one.
+    region_overflow,
 };
 
 pub const Fault = struct {
