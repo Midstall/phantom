@@ -27,6 +27,15 @@ pub const MainAxisAlignment = enum {
 };
 pub const CrossAxisAlignment = enum { start, center, end };
 
+/// How much of the main axis a `Flex` claims for itself. `.max` fills the
+/// bound it was given, the long-standing behaviour. `.min` reports only the
+/// extent its children actually took, so a `Row` or `Column` hugs its
+/// content instead of stretching to a wide bound. A `Flexible` or `Expanded`
+/// child asks for a share of the space `.min` is trying not to take; `.min`
+/// wins, so that child sees no free space and gets none, the same treatment
+/// a flex factor gets on a genuinely unbounded axis.
+pub const MainAxisSize = enum { max, min };
+
 /// How much of its share a flexible child must take. `Expanded` uses `.tight`,
 /// so the child fills the share exactly; `Flexible` uses `.loose`, so the child
 /// may report a smaller size and give the rest back to the alignment.
@@ -149,6 +158,7 @@ pub const RenderFlex = struct {
     direction: Axis,
     main: MainAxisAlignment,
     cross: CrossAxisAlignment,
+    main_size: MainAxisSize = .max,
     /// Where an allocation failure during layout is reported. A dropped child is
     /// invisible on screen, so it must never fail silently. Null only for a
     /// stack-owned RenderFlex that no widget mounted.
@@ -225,9 +235,12 @@ pub const RenderFlex = struct {
             inflexible_main += mainExtent(self.direction, cs);
             if (crossExtent(self.direction, cs) > total_cross) total_cross = crossExtent(self.direction, cs);
         }
-        // When main axis is unbounded, the flex shrinks to fit its children; otherwise
-        // it fills the available space as before.
-        const main_ext = if (main_unbounded) inflexible_main else mainExtent(self.direction, size);
+        // When main axis is unbounded, the flex shrinks to fit its children; `.min`
+        // asks for that same shrink on an axis that is bounded. Either way there is
+        // no free space: a flexible child's share below comes out to zero, and the
+        // main alignment has nothing left to distribute.
+        const shrink_main = main_unbounded or self.main_size == .min;
+        const main_ext = if (shrink_main) inflexible_main else mainExtent(self.direction, size);
 
         // Second pass: share what is left in proportion to the flex factors.
         var total_main = inflexible_main;
@@ -271,10 +284,10 @@ pub const RenderFlex = struct {
         return switch (self.direction) {
             .vertical => .{
                 .width = cross_ext,
-                .height = if (main_unbounded) total_main else size.height,
+                .height = if (shrink_main) total_main else size.height,
             },
             .horizontal => .{
-                .width = if (main_unbounded) total_main else size.width,
+                .width = if (shrink_main) total_main else size.width,
                 .height = cross_ext,
             },
         };
@@ -307,6 +320,7 @@ pub const Flex = struct {
     direction: Axis = .vertical,
     main: MainAxisAlignment = .start,
     cross: CrossAxisAlignment = .start,
+    main_size: MainAxisSize = .max,
     children: []const Widget,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
@@ -337,6 +351,7 @@ pub const Flex = struct {
             .direction = self.direction,
             .main = self.main,
             .cross = self.cross,
+            .main_size = self.main_size,
             .sink = bctx.owner.sink,
         };
         const el = gpa.create(Element) catch |e| {
@@ -363,6 +378,7 @@ pub const Flex = struct {
         rf.direction = self.direction;
         rf.main = self.main;
         rf.cross = self.cross;
+        rf.main_size = self.main_size;
         try el.updateChildren(self.children, bctx);
         syncChildren(rf, el, bctx.owner.gpa);
     }
@@ -436,11 +452,21 @@ pub fn Expanded(opts: struct { flex: u16 = 1, child: Widget }) Flexible {
     return .{ .flex = opts.flex, .fit = .tight, .child = opts.child };
 }
 
-pub fn Column(opts: struct { main: MainAxisAlignment = .start, cross: CrossAxisAlignment = .start, children: []const Widget }) Flex {
-    return .{ .direction = .vertical, .main = opts.main, .cross = opts.cross, .children = opts.children };
+pub fn Column(opts: struct {
+    main: MainAxisAlignment = .start,
+    cross: CrossAxisAlignment = .start,
+    main_size: MainAxisSize = .max,
+    children: []const Widget,
+}) Flex {
+    return .{ .direction = .vertical, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .children = opts.children };
 }
-pub fn Row(opts: struct { main: MainAxisAlignment = .start, cross: CrossAxisAlignment = .start, children: []const Widget }) Flex {
-    return .{ .direction = .horizontal, .main = opts.main, .cross = opts.cross, .children = opts.children };
+pub fn Row(opts: struct {
+    main: MainAxisAlignment = .start,
+    cross: CrossAxisAlignment = .start,
+    main_size: MainAxisSize = .max,
+    children: []const Widget,
+}) Flex {
+    return .{ .direction = .horizontal, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .children = opts.children };
 }
 
 // Test-only render object: reports a fixed physical size (ignores constraints)
@@ -556,6 +582,106 @@ test "RenderFlex horizontal (Row) stacks on x" {
     _ = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 200, .height = 100 }));
     try std.testing.expectEqual(@as(f32, 0), rf.offsets.items[0].x);
     try std.testing.expectEqual(@as(f32, 20), rf.offsets.items[1].x); // after child a's width
+}
+
+test "a .min Row inside a wide bounded constraint reports the width its children took, not the constraint's width" {
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(20, 30);
+    var b = FixedBox.make(30, 30);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .horizontal,
+        .main = .start,
+        .cross = .start,
+        .main_size = .min,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+
+    // The bound is 1000, far past what the two children need.
+    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 1000, .height = 100 }));
+    try std.testing.expectEqual(@as(f32, 50), size.width); // 20 + 30, not 1000
+}
+
+test "the same Row with the default .max main size still reports the constraint's width" {
+    // Pins that nothing regressed: a plain Row, main_size left at its default,
+    // keeps filling its bound the way it always has.
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(20, 30);
+    var b = FixedBox.make(30, 30);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .horizontal,
+        .main = .start,
+        .cross = .start,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+
+    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 1000, .height = 100 }));
+    try std.testing.expectEqual(@as(f32, 1000), size.width);
+}
+
+test "a .min Row centered on its main axis still packs its children at the leading edge, since it left no free space to centre them in" {
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(20, 30);
+    var b = FixedBox.make(30, 30);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .horizontal,
+        .main = .center,
+        .cross = .start,
+        .main_size = .min,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+
+    _ = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 1000, .height = 100 }));
+    // A `.min` row's own size is its children's extent, so there is no slack
+    // between that extent and the row's reported width for `.center` to
+    // split. Both children sit exactly where `.start` would have put them.
+    try std.testing.expectEqual(@as(f32, 0), rf.offsets.items[0].x);
+    try std.testing.expectEqual(@as(f32, 20), rf.offsets.items[1].x);
+}
+
+test "a .min Column end-aligned on its main axis still packs its children at the leading edge, since it left no free space to push them down" {
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(30, 20);
+    var b = FixedBox.make(30, 40);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .vertical,
+        .main = .end,
+        .cross = .start,
+        .main_size = .min,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+
+    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 900 }));
+    try std.testing.expectEqual(@as(f32, 60), size.height); // 20 + 40, not 900
+    try std.testing.expectEqual(@as(f32, 0), rf.offsets.items[0].y);
+    try std.testing.expectEqual(@as(f32, 20), rf.offsets.items[1].y);
 }
 
 test "Flex widget mounts children, syncs render objects, stacks two Texts vertically" {
