@@ -85,7 +85,7 @@ pub const WebApp = struct {
     /// router, which is every application that does not use one.
     pub fn navigate(self: *WebApp, path: []const u8) void {
         const h = self.owner.router orelse return;
-        h.replace(path);
+        applyLocation(h, path);
         self.render();
     }
 
@@ -103,6 +103,29 @@ pub const WebApp = struct {
         self.navigate(path);
     }
 };
+
+/// Reconciles the router's stack with a browser-driven address change.
+///
+/// The rule: pop when `path` is the entry already sitting below the stack's
+/// top, replace otherwise.
+///
+/// Back and forward both arrive here as a bare path; the History API gives no
+/// direction. A press of Back always lands on the entry the router's stack
+/// already holds one below its top, because that is what "back" means, so
+/// that case pops and the stack shrinks. Forward, and any other address
+/// change, do not match a below-top entry: a popped entry is gone from the
+/// router's stack the instant it pops, so the router has nothing to push
+/// back. Rather than guess a forward stack it does not have, it replaces the
+/// top so the built route tracks the address bar. Replacing here is what
+/// keeps the stack from growing on a busy back-and-forth: only a real push
+/// (a tapped `RouteLink`) grows it, and only a matched pop shrinks it.
+fn applyLocation(h: phantom.RouterHandle, path: []const u8) void {
+    if (h.isBelowTop(path)) {
+        _ = h.pop();
+    } else {
+        h.replace(path);
+    }
+}
 
 fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
@@ -438,4 +461,42 @@ test "a browser tick advances the wall clock and the monotonic clock separately"
 
     try std.testing.expectEqual(@as(i96, 1_767_225_840_000_000_000), app.wall_ns);
     try std.testing.expectEqual(@as(i96, 4_200_000_000), app.mono_ns);
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2: browser back/forward must never grow the router's stack past
+// max_stack, however many times it happens.
+// ---------------------------------------------------------------------------
+
+fn ratchetHome(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Text{ .text = "home" }).widget();
+}
+fn ratchetA(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Text{ .text = "a" }).widget();
+}
+const ratchet_routes = [_]phantom.Route{
+    .{ .path = "/", .build = ratchetHome },
+    .{ .path = "/a", .build = ratchetA },
+};
+
+test "clicking a link then pressing back, repeated far more times than max_stack, never exhausts the router's stack" {
+    const gpa = std.testing.allocator;
+    const r = phantom.Router{ .routes = &ratchet_routes, .initial = "/", .not_found = ratchetHome };
+    var h = try phantom.testing.mount(gpa, r.widget());
+    defer h.deinit();
+    const handle = h.owner.router orelse return error.NoRouterClaimed;
+
+    // A RouteLink push always grows the stack by one; a matched browser
+    // back must always shrink it back by one, or a nav bar that alternates
+    // the two (the ordinary way to use one) fills the stack for good in
+    // well under a minute (this is the bug report). max_stack * 4 clears
+    // that bar by a wide margin.
+    var i: usize = 0;
+    while (i < phantom.router.max_stack * 4) : (i += 1) {
+        handle.push("/a");
+        applyLocation(handle, "/");
+    }
+
+    try std.testing.expect(handle.depth() <= 2);
+    try h.expectNoFaults();
 }

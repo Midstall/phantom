@@ -114,6 +114,14 @@ pub const RouterHandle = struct {
     pub fn replace(self: RouterHandle, path: []const u8) void {
         self.state.replace(path);
     }
+    pub fn depth(self: RouterHandle) usize {
+        return self.state.stack.depth();
+    }
+    /// True when `path` is the entry directly below the stack's top: what a
+    /// single browser Back press always lands on.
+    pub fn isBelowTop(self: RouterHandle, path: []const u8) bool {
+        return self.state.isBelowTop(path);
+    }
 };
 
 /// Publishes the handle to the subtree. Same shape as `Theme`: an element with
@@ -225,6 +233,14 @@ pub const Router = struct {
 
         pub fn location(s: *const State) []const u8 {
             return s.stack.current();
+        }
+
+        /// True when `path` is the entry the stack would show if it popped
+        /// once. A single browser Back press always lands there, which is
+        /// how `web.zig` tells a Back from every other address change.
+        pub fn isBelowTop(s: *const State, path: []const u8) bool {
+            if (s.stack.count < 2) return false;
+            return std.mem.eql(u8, s.stack.entries[s.stack.count - 2].slice(), path);
         }
 
         pub fn push(s: *State, path: []const u8) void {
