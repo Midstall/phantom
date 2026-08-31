@@ -129,14 +129,16 @@ fn applyLocation(h: phantom.RouterHandle, path: []const u8) void {
 
 fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
-    const f = app.ops.open_url orelse return;
-    f(app.ops.ctx, url);
+    // `init` installs this thunk only when `ops.open_url` is set, so the
+    // hook is never null here.
+    app.ops.open_url.?(app.ops.ctx, url);
 }
 
 fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
-    const f = app.ops.read_location orelse return buf[0..0];
-    return f(app.ops.ctx, buf) orelse {
+    // `init` installs this thunk only when `ops.read_location` is set, so the
+    // hook is never null here.
+    return app.ops.read_location.?(app.ops.ctx, buf) orelse {
         // The real address does not fit `buf`. Taking the first max_path
         // bytes would land the tree on a different, shorter route than the
         // one the user is actually on, so the read is refused instead.
@@ -147,7 +149,8 @@ fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
 
 fn writeLocationThunk(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
-    const f = app.ops.write_location orelse return;
+    // `init` installs this thunk only when `ops.write_location` is set, so
+    // the hook is never null here.
     // Skip the browser call when the address bar already shows this path. A
     // browser-driven back or forward already moved it before this runs
     // (through `locationChanged`), and writing again would add a duplicate
@@ -158,7 +161,7 @@ fn writeLocationThunk(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode
             if (std.mem.eql(u8, cur, path)) return;
         }
     }
-    f(app.ops.ctx, path, mode);
+    app.ops.write_location.?(app.ops.ctx, path, mode);
 }
 
 fn webNow(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
@@ -253,12 +256,19 @@ pub fn init(
     owner.dispatcher = &app.dispatcher;
     owner.io = webIo(app);
     // Wired before the tree mounts, so a Router's first `sync` (from its
-    // initial location) already reaches the address bar.
+    // initial location) already reaches the address bar, and its first
+    // `readLocation` (the deep-link read in `initState`) already reads it.
+    //
+    // Each hook is installed only when the matching `DomOps` member exists.
+    // A host that leaves one null gets a null here too, not a thunk that
+    // silently does nothing: `Platform.openUrl` must return false so
+    // `Link.tap` reports `link_unsupported`, and `Platform.readLocation` must
+    // return null so a missing hook cannot be mistaken for an empty address.
     owner.platform = .{
         .ctx = app,
-        .open_url = openUrlThunk,
-        .read_location = readLocationThunk,
-        .write_location = writeLocationThunk,
+        .open_url = if (ops.open_url != null) openUrlThunk else null,
+        .read_location = if (ops.read_location != null) readLocationThunk else null,
+        .write_location = if (ops.write_location != null) writeLocationThunk else null,
         .strategy = strategy,
     };
 
@@ -499,4 +509,80 @@ test "clicking a link then pressing back, repeated far more times than max_stack
 
     try std.testing.expect(handle.depth() <= 2);
     try h.expectNoFaults();
+}
+
+// ---------------------------------------------------------------------------
+// Bug 3: web.init must not install a hook the host never gave it. A missing
+// hook and an over-long address are different faults and must stay
+// distinguishable.
+// ---------------------------------------------------------------------------
+
+fn linkRoot(b: *phantom.BuildContext) phantom.Widget {
+    const box = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    return b.new(phantom.Link{ .url = "https://example.com", .child = b.new(box).widget() }).widget();
+}
+
+fn plainRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) }).widget();
+}
+
+fn locFaultRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Router{ .routes = &loc_fault_routes, .initial = "/", .not_found = locFaultHome }).widget();
+}
+
+/// Frees everything `init` allocates. `init`'s own doc comment says "never
+/// deinit: the page owns it", which is right for the real page, whose
+/// process exits from under the app; a test has no such exit, so it tears
+/// down by hand instead of leaking under the testing allocator.
+fn destroyWebApp(gpa: std.mem.Allocator, app: *WebApp) void {
+    app.root.deinit(gpa);
+    app.owner.deinit();
+    gpa.destroy(app.owner);
+    gpa.destroy(app.sink);
+    app.arena.deinit();
+    gpa.destroy(app.arena);
+    gpa.destroy(app);
+}
+
+test "web.init leaves the platform's open_url unset when the host has no open_url hook, so a tapped Link reports it is unsupported" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(linkRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    try std.testing.expect(!app.owner.platform.openUrl("https://example.com"));
+
+    const ro = app.root.renderObject().?;
+    app.dispatchTap(ro.origin.x + ro.size.width * 0.5, ro.origin.y + ro.size.height * 0.5);
+
+    const f = app.sink.first orelse return error.NoFaultRecorded;
+    try std.testing.expectEqual(phantom.FaultCode.link_unsupported, f.code);
+}
+
+test "web.init leaves the platform's read_location unset when the host has no read_location hook, so a missing hook is not mistaken for an empty address" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var ops = rec.ops();
+    ops.read_location = null;
+    const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    var buf: [phantom.router.max_path]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), app.owner.platform.readLocation(&buf));
+}
+
+test "locationChanged does nothing when the host has no read_location hook, rather than routing to an empty path" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var ops = rec.ops();
+    ops.read_location = null;
+    const app = try init(gpa, ops, phantom.Root.plain(locFaultRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    app.locationChanged();
+
+    try std.testing.expect(app.sink.ok());
 }
