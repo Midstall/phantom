@@ -70,6 +70,9 @@ pub const AppOptions = struct {
     optimize: std.builtin.OptimizeMode,
     web_runtime: WebRuntime = .auto,
     url_strategy: UrlStrategy = .hash,
+    /// Paths that get their own copy of the page, so a refresh works on a static
+    /// host. Only read with the `.path` strategy. `/` is always written.
+    prerender_routes: []const []const u8 = &.{},
 };
 
 /// The binary name for an app. Borrows both arguments and returns a slice into

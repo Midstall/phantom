@@ -358,6 +358,32 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     const html_lp = b.addWriteFiles().add("index.html", html_src);
     step.dependOn(&b.addInstallFile(html_lp, b.fmt("{s}/index.html", .{dist_dir})).step);
 
+    // prerender_routes only means something with the .path strategy: a .hash
+    // route lives after the '#', so a host never requests the plain path and
+    // the extra copy goes unused. Report it rather than fail the build, since
+    // the app still works, it just carries a dead copy.
+    if (opts.url_strategy == .hash and opts.prerender_routes.len > 0) {
+        std.log.warn(
+            "phantom.addApp: prerender_routes is set but url_strategy is .hash ({d} routes ignored)",
+            .{opts.prerender_routes.len},
+        );
+    }
+
+    // With the .path strategy, write a standalone copy of the page at each
+    // route so a static host answers a refresh with 200 instead of 404.
+    // "/gallery" becomes "dist/{id}/gallery/index.html", so a static host
+    // serves the same application for that path with no rewrite rule. A
+    // route with a '/' inside it, such as "/docs/intro", works the same way,
+    // because the install path keeps the separator.
+    if (opts.url_strategy == .path) {
+        for (opts.prerender_routes) |route| {
+            const trimmed = std.mem.trim(u8, route, "/");
+            if (trimmed.len == 0) continue;
+            const dest = b.fmt("{s}/{s}/index.html", .{ dist_dir, trimmed });
+            step.dependOn(&b.addInstallFile(html_lp, dest).step);
+        }
+    }
+
     // Dev-serve: `zig build serve-<name>` serves dist/{id}/ over http via the first
     // available runtime, using an inline zero-dependency static server that sets
     // application/wasm for .wasm (required for WebAssembly.instantiateStreaming).
@@ -371,6 +397,10 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
 // expose a positional arg at a stable argv index, so an env var is used uniformly).
 // Content-Type: .wasm -> application/wasm, .js -> text/javascript,
 // .html -> text/html, anything else -> application/octet-stream.
+// A path with no file extension is a route, not a file, so it maps to that
+// path's own index.html. This mirrors the prerendered copies addWebApp
+// writes for the .path url strategy, so a browser refresh on a route works
+// on the dev server the same way it works on a static host.
 const node_serve_js =
     \\const http = require('http');
     \\const fs = require('fs');
@@ -384,8 +414,10 @@ const node_serve_js =
     \\  return 'application/octet-stream';
     \\}
     \\http.createServer(function(req, res) {
-    \\  let url = req.url === '/' ? '/index.html' : req.url;
-    \\  let file = path.join(dir, url.split('?')[0]);
+    \\  let pathname = req.url.split('?')[0];
+    \\  if (pathname === '/') pathname = '/index.html';
+    \\  else if (!path.extname(pathname)) pathname += '/index.html';
+    \\  let file = path.join(dir, pathname);
     \\  process.stdout.write(req.method + ' ' + req.url + '\n');
     \\  fs.readFile(file, function(err, data) {
     \\    if (err) { res.writeHead(404); res.end('not found'); return; }
@@ -411,6 +443,7 @@ const bun_serve_js =
     \\  async fetch(req) {
     \\    const url = new URL(req.url);
     \\    let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
+    \\    if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
     \\    const file = dir + pathname;
     \\    console.log(req.method + ' ' + url.pathname);
     \\    const f = Bun.file(file);
@@ -433,6 +466,7 @@ const deno_serve_js =
     \\Deno.serve({ port: 8080 }, async function(req) {
     \\  const url = new URL(req.url);
     \\  let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
+    \\  if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
     \\  const file = dir + pathname;
     \\  console.log(req.method + ' ' + url.pathname);
     \\  try {
