@@ -17,6 +17,10 @@ pub const FaultCode = enum {
     /// A peer spoke the protocol wrongly. Terminal input that does not parse lands
     /// here. It is a recovered runtime fault and never a programmer error.
     protocol,
+    /// No route in the table matches the current location.
+    route_not_found,
+    /// A navigation was refused. The path was too long, or the history is full.
+    route_rejected,
 };
 
 pub const Fault = struct {

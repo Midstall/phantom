@@ -77,6 +77,201 @@ pub const Stack = struct {
     }
 };
 
+/// One entry in the route table. `build` runs on every frame the route is on
+/// top, so it holds no state of its own.
+pub const Route = struct {
+    path: []const u8,
+    build: *const fn (*BuildContext) Widget,
+};
+
+/// The handle a descendant reaches through `Router.of`. It holds the state
+/// pointer, which the stateful element owns and keeps at one address for the
+/// life of the router, so a tap handler can hold it between frames.
+pub const RouterHandle = struct {
+    state: *Router.State,
+
+    pub fn location(self: RouterHandle) []const u8 {
+        return self.state.location();
+    }
+    pub fn push(self: RouterHandle, path: []const u8) void {
+        self.state.push(path);
+    }
+    pub fn pop(self: RouterHandle) bool {
+        return self.state.pop();
+    }
+    pub fn replace(self: RouterHandle, path: []const u8) void {
+        self.state.replace(path);
+    }
+};
+
+/// Publishes the handle to the subtree. Same shape as `Theme`: an element with
+/// an inherited id and no render object of its own.
+pub const RouterScope = struct {
+    /// Points at the `handle` field the State owns. A value copy here would
+    /// live in the build arena, which is reset after every frame, and a tap
+    /// handler that read it later would read freed memory.
+    handle: *const RouterHandle,
+    child: Widget,
+
+    const vtable = Widget.VTable{ .mount = mount, .update = update };
+
+    pub fn widget(self: *const RouterScope) Widget {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn mount(ptr: *const anyopaque, bctx: *BuildContext, parent: ?*Element) anyerror!*Element {
+        const self: *const RouterScope = @ptrCast(@alignCast(ptr));
+        const el = try bctx.owner.gpa.create(Element);
+        el.* = .{
+            .owner = bctx.owner,
+            .parent = parent,
+            .vtable = &vtable,
+            .type_name = @typeName(RouterScope),
+            .render_object = null,
+            .inherited_id = phantom.typeId(RouterHandle),
+            .inherited_data = self.handle,
+            .depth = phantom.widget.depthOf(parent),
+        };
+        el.child = try el.updateChild(null, self.child, bctx);
+        return el;
+    }
+
+    fn update(ptr: *const anyopaque, el: *Element, bctx: *BuildContext) anyerror!void {
+        const self: *const RouterScope = @ptrCast(@alignCast(ptr));
+        el.inherited_data = self.handle;
+        el.child = try el.updateChild(el.child, self.child, bctx);
+    }
+};
+
+/// The router. Holds the history, selects one route, and publishes a handle to
+/// its subtree.
+pub const Router = struct {
+    routes: []const Route,
+    initial: []const u8 = "/",
+    not_found: *const fn (*BuildContext) Widget,
+
+    pub fn widget(self: *const Router) Widget {
+        return phantom.StatefulWidget(Router, self);
+    }
+
+    /// The nearest router above the current build point, or null when there is
+    /// none. A caller that navigates unconditionally should assert on the null.
+    pub fn of(bctx: *BuildContext) ?*const RouterHandle {
+        return phantom.inheritedOf(bctx.element, RouterHandle);
+    }
+
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        stack: Stack = undefined,
+        routes: []const Route = &.{},
+        not_found: *const fn (*BuildContext) Widget = undefined,
+        /// Set by `initState`, so a config with a path that is too long fails
+        /// once at mount and the tree still builds.
+        handle: RouterHandle = undefined,
+
+        pub fn initState(s: *State, config: *const Router) !void {
+            s.stack = try Stack.init(config.initial);
+            s.routes = config.routes;
+            s.not_found = config.not_found;
+            s.handle = .{ .state = s };
+        }
+
+        pub fn location(s: *const State) []const u8 {
+            return s.stack.current();
+        }
+
+        pub fn push(s: *State, path: []const u8) void {
+            s.stack.push(path) catch |e| {
+                s.base.element.owner.sink.report(.route_rejected, @errorName(e));
+                return;
+            };
+            s.sync();
+            phantom.markNeedsBuild(s);
+        }
+
+        pub fn pop(s: *State) bool {
+            if (!s.stack.pop()) return false;
+            s.sync();
+            phantom.markNeedsBuild(s);
+            return true;
+        }
+
+        pub fn replace(s: *State, path: []const u8) void {
+            s.stack.replace(path) catch |e| {
+                s.base.element.owner.sink.report(.route_rejected, @errorName(e));
+                return;
+            };
+            s.sync();
+            phantom.markNeedsBuild(s);
+        }
+
+        /// Task 4 fills this in with the browser location. It is a separate
+        /// method so the navigation methods above never grow a second concern.
+        fn sync(s: *State) void {
+            _ = s;
+        }
+
+        pub fn build(s: *State, b: *BuildContext) anyerror!Widget {
+            const here = s.location();
+            const child = for (s.routes) |r| {
+                if (std.mem.eql(u8, r.path, here)) break r.build(b);
+            } else blk: {
+                b.owner.sink.report(.route_not_found, here);
+                break :blk s.not_found(b);
+            };
+            return b.new(RouterScope{ .handle = &s.handle, .child = child }).widget();
+        }
+    };
+};
+
+/// Pushes a route when tapped. The target path lives on the State, which the
+/// element owns, so the tap handler never reads a build arena that was reset.
+pub const RouteLink = struct {
+    to: []const u8,
+    child: Widget,
+
+    pub fn widget(self: *const RouteLink) Widget {
+        return phantom.StatefulWidget(RouteLink, self);
+    }
+
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        target: Location = .{},
+        child: Widget = undefined,
+        /// A copy, not a pointer. `Router.of` returns a pointer into the
+        /// router State, which is stable, but copying the small struct keeps
+        /// this State free of any question about who outlives whom.
+        handle: ?RouterHandle = null,
+
+        pub fn initState(s: *State, config: *const RouteLink) !void {
+            try s.target.set(config.to);
+            s.child = config.child;
+        }
+
+        pub fn didUpdateWidget(s: *State, config: *const RouteLink) !void {
+            try s.target.set(config.to);
+            s.child = config.child;
+        }
+
+        fn tap(ctx: *anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            const h = s.handle orelse return;
+            h.push(s.target.slice());
+        }
+
+        pub fn build(s: *State, b: *BuildContext) anyerror!Widget {
+            // Resolved on every build, because a rebuilt tree can move this
+            // link under a different router.
+            s.handle = if (Router.of(b)) |h| h.* else null;
+            return b.new(phantom.GestureDetector{
+                .on_tap = tap,
+                .ctx = s,
+                .child = s.child,
+            }).widget();
+        }
+    };
+};
+
 test "a location holds the path it was set from" {
     var loc = Location{};
     try loc.set("/gallery");
@@ -133,4 +328,83 @@ test "the stack copies the path, so a caller's buffer can change afterwards" {
     var s = try Stack.init(&buf);
     buf[1] = 'b';
     try std.testing.expectEqualStrings("/a", s.current());
+}
+
+// ---------------------------------------------------------------------------
+// Router widget tests
+// ---------------------------------------------------------------------------
+
+const phantom = @import("../phantom.zig");
+const Widget = phantom.Widget;
+const Element = phantom.Element;
+const BuildContext = phantom.BuildContext;
+
+fn homePage(b: *BuildContext) Widget {
+    return b.new(phantom.Text{ .text = "home" }).widget();
+}
+
+fn galleryPage(b: *BuildContext) Widget {
+    return b.new(phantom.Text{ .text = "gallery" }).widget();
+}
+
+fn missingPage(b: *BuildContext) Widget {
+    return b.new(phantom.Text{ .text = "missing" }).widget();
+}
+
+const test_routes = [_]Route{
+    .{ .path = "/", .build = homePage },
+    .{ .path = "/gallery", .build = galleryPage },
+};
+
+test "the router builds the route that matches the initial path" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    try h.expectNoFaults();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    try std.testing.expectEqualStrings("/", state.location());
+}
+
+test "a push builds the other route" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    state.push("/gallery");
+    try h.pump();
+    try std.testing.expectEqualStrings("/gallery", state.location());
+    try h.expectNoFaults();
+}
+
+test "a pop returns to the route below" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    state.push("/gallery");
+    try h.pump();
+    try std.testing.expect(state.pop());
+    try h.pump();
+    try std.testing.expectEqualStrings("/", state.location());
+}
+
+test "an unknown path builds the not-found route and reports a fault" {
+    const r = Router{ .routes = &test_routes, .initial = "/nowhere", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    try std.testing.expectEqualStrings("/nowhere", state.location());
+    try h.expectFault(.route_not_found);
+}
+
+test "a path longer than the buffer is refused and the location does not change" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    const long = "/" ++ ("a" ** max_path);
+    state.push(long);
+    try h.pump();
+    try std.testing.expectEqualStrings("/", state.location());
+    try h.expectFault(.route_rejected);
 }

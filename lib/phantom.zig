@@ -175,6 +175,12 @@ pub const Theme = theme.Theme;
 pub const ThemeData = theme.ThemeData;
 pub const ColorScheme = theme.ColorScheme;
 
+pub const router = @import("phantom/router.zig");
+pub const Router = router.Router;
+pub const Route = router.Route;
+pub const RouteLink = router.RouteLink;
+pub const RouterHandle = router.RouterHandle;
+
 pub const view = @import("phantom/view.zig");
 pub const View = view.View;
 pub const MediaQueryData = view.MediaQueryData;
