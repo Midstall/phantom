@@ -421,9 +421,11 @@ test "the router builds the route that matches the initial path" {
     const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
     var h = try phantom.testing.mount(std.testing.allocator, r.widget());
     defer h.deinit();
+    try h.pump();
     try h.expectNoFaults();
-    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
-    try std.testing.expectEqualStrings("/", state.location());
+    // Pins the BUILT tree, not the location string: swapping in the
+    // not-found builder here would still leave `state.location()` at "/".
+    try h.expectHtml("home");
 }
 
 test "a push builds the other route" {
@@ -433,7 +435,7 @@ test "a push builds the other route" {
     const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
     state.push("/gallery");
     try h.pump();
-    try std.testing.expectEqualStrings("/gallery", state.location());
+    try h.expectHtml("gallery");
     try h.expectNoFaults();
 }
 
@@ -446,7 +448,7 @@ test "a pop returns to the route below" {
     try h.pump();
     try std.testing.expect(state.pop());
     try h.pump();
-    try std.testing.expectEqualStrings("/", state.location());
+    try h.expectHtml("home");
 }
 
 test "an unknown path builds the not-found route and reports a fault" {
@@ -691,15 +693,22 @@ test "a RouteLink with no Router above it reports route_rejected on tap" {
     try h.expectFault(.route_rejected);
 }
 
-test "Router.of returns a handle whose location matches the router above it" {
+test "Router.of returns a handle wired to the live router, so pushing through it changes what the router builds" {
+    // The old version of this test compared a handle's location against the
+    // very state it holds, which cannot fail: pin that the handle actually
+    // reaches the router by driving a navigation through it and checking the
+    // BUILT tree, the same standard the tests above hold `push` and `pop` to.
     const r = Router{ .routes = &link_routes, .initial = "/", .not_found = missingPage };
     var h = try phantom.testing.mount(std.testing.allocator, r.widget());
     defer h.deinit();
     try h.pump();
-    const router_state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
     const link_state = try h.stateOf(phantom.testing.find.byType(RouteLink), RouteLink.State);
     const handle = link_state.handle orelse return error.NoRouterHandle;
-    try std.testing.expectEqualStrings(router_state.location(), handle.location());
+
+    handle.push("/gallery");
+    try h.pump();
+
+    try h.expectHtml("gallery");
 }
 
 test "a RouteLink rebuilt after the build arena resets still navigates on tap" {
