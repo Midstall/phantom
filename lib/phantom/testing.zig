@@ -283,12 +283,21 @@ pub const Harness = struct {
 };
 
 pub fn mount(gpa: std.mem.Allocator, root_widget: phantom.Widget) !Harness {
+    return mountWithPlatform(gpa, root_widget, .{});
+}
+
+/// Same as `mount`, but wires `plat` onto the owner before the tree mounts.
+/// Plain `mount` cannot offer this: it builds the owner and mounts in one
+/// call, with no point in between to set the platform, and `Router.State`
+/// reads the platform's location during `initState`, which runs at mount.
+pub fn mountWithPlatform(gpa: std.mem.Allocator, root_widget: phantom.Widget, plat: phantom.Platform) !Harness {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
     const sink = try gpa.create(phantom.FaultSink);
     sink.* = .{};
     const owner = try gpa.create(phantom.BuildOwner);
     owner.* = .{ .gpa = gpa, .sink = sink };
+    owner.platform = plat;
     const focus = try gpa.create(phantom.FocusManager);
     focus.* = .{};
     owner.focus = focus;

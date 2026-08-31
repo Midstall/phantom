@@ -77,6 +77,18 @@ pub const Stack = struct {
     }
 };
 
+/// Turns a raw platform location into the path the router stores, according
+/// to the strategy that produced it. A hash location carries a leading '#'
+/// and an empty hash means the root path; a path location is already the
+/// path. Idempotent on an already-clean path, so a host that normalizes the
+/// address itself before handing it over costs nothing extra here.
+fn startPath(strategy: @import("platform.zig").UrlStrategy, raw: []const u8) []const u8 {
+    if (strategy != .hash) return raw;
+    var s = raw;
+    if (s.len > 0 and s[0] == '#') s = s[1..];
+    return if (s.len == 0) "/" else s;
+}
+
 /// One entry in the route table. `build` runs on every frame the route is on
 /// top, so it holds no state of its own.
 pub const Route = struct {
@@ -175,7 +187,18 @@ pub const Router = struct {
         handle: RouterHandle = undefined,
 
         pub fn initState(s: *State, config: *const Router) !void {
-            s.stack = try Stack.init(config.initial);
+            const plat = s.base.element.owner.platform;
+            var loc_buf: [max_path]u8 = undefined;
+            // A platform with a location hook means a real browser sits
+            // behind this build, and the visitor may already be parked on a
+            // deep link, a refresh, or a shared URL. `config.initial` is only
+            // ever right for a fresh visit to "/", so the browser's own
+            // answer wins whenever there is one. Every native backend leaves
+            // the hook null, so `config.initial` is the whole answer there.
+            s.stack = try Stack.init(if (plat.readLocation(&loc_buf)) |raw|
+                startPath(plat.strategy, raw)
+            else
+                config.initial);
             s.routes = config.routes;
             s.not_found = config.not_found;
             s.handle = .{ .state = s };
@@ -445,6 +468,69 @@ test "a path longer than the buffer is refused and the location does not change"
     try h.pump();
     try std.testing.expectEqualStrings("/", state.location());
     try h.expectFault(.route_rejected);
+}
+
+// ---------------------------------------------------------------------------
+// Deep link tests: a visitor who opens, refreshes, or shares a route other
+// than "/" must land on that route, not on config.initial (Bug 1).
+// ---------------------------------------------------------------------------
+
+const FakeLocationHook = struct {
+    raw: []const u8,
+
+    fn read(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+        const self: *const FakeLocationHook = @ptrCast(@alignCast(ctx));
+        @memcpy(buf[0..self.raw.len], self.raw);
+        return buf[0..self.raw.len];
+    }
+};
+
+test "a browser parked at /gallery boots the router straight to the gallery route under the path strategy" {
+    var hook = FakeLocationHook{ .raw = "/gallery" };
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mountWithPlatform(std.testing.allocator, r.widget(), .{
+        .ctx = &hook,
+        .read_location = FakeLocationHook.read,
+        .strategy = .path,
+    });
+    defer h.deinit();
+    try h.pump();
+    try h.expectHtml("gallery");
+}
+
+test "a browser parked at #/gallery boots the router straight to the gallery route under the hash strategy" {
+    var hook = FakeLocationHook{ .raw = "#/gallery" };
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mountWithPlatform(std.testing.allocator, r.widget(), .{
+        .ctx = &hook,
+        .read_location = FakeLocationHook.read,
+        .strategy = .hash,
+    });
+    defer h.deinit();
+    try h.pump();
+    try h.expectHtml("gallery");
+}
+
+test "an empty hash boots the router to the root route rather than a blank one" {
+    var hook = FakeLocationHook{ .raw = "#" };
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mountWithPlatform(std.testing.allocator, r.widget(), .{
+        .ctx = &hook,
+        .read_location = FakeLocationHook.read,
+        .strategy = .hash,
+    });
+    defer h.deinit();
+    try h.pump();
+    try h.expectHtml("home");
+    try h.expectNoFaults();
+}
+
+test "a native backend with no location hook boots the router to config.initial" {
+    const r = Router{ .routes = &test_routes, .initial = "/gallery", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    try h.pump();
+    try h.expectHtml("gallery");
 }
 
 // ---------------------------------------------------------------------------
