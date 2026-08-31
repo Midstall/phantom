@@ -267,4 +267,5 @@ test {
     _ = @import("phantom/widgets/keyboard_listener.zig");
     _ = @import("phantom/tui/kitty_gfx.zig");
     _ = @import("phantom/backend/tui_pixels.zig");
+    _ = @import("phantom/router.zig");
 }
