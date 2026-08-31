@@ -553,6 +553,46 @@ test "an interactive rectangle gets a pointer cursor and a plain one does not" {
     try std.testing.expect(!contains(rec.log.items, ".pb1"));
 }
 
+test "dom_calls: a wrapped paragraph's three text runs each set a different line, never the whole paragraph" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+
+    // Narrow enough that "one", "two" and "three" each land on their own line.
+    const source = "one two three";
+    const m = text.mono.TextMetrics{ .mono = text.mono.Mono.fromCell(10, 20) };
+    var p = try text.layout.layoutParagraph(gpa, &font, source, 14, m, 55);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), p.lines.len);
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    var y: f32 = 0;
+    for (p.lines) |l| {
+        try list.append(gpa, .{ .text = .{
+            .glyphs = l.glyphs,
+            .text = source[l.start..l.end],
+            .font = &font,
+            .size = 14,
+            .color = geometry.Color.rgb(1, 1, 1),
+            .origin = .{ .x = 0, .y = y },
+        } });
+        y += l.height;
+    }
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+
+    // Three distinct setTextContent calls, one per line, exactly matching the
+    // line each was drawn for.
+    try std.testing.expect(contains(rec.log.items, "setTextContent(102,one)"));
+    try std.testing.expect(contains(rec.log.items, "setTextContent(103,two)"));
+    try std.testing.expect(contains(rec.log.items, "setTextContent(104,three)"));
+    // This is what a run holding `self.text` (the whole paragraph) would have
+    // produced on every line, and is exactly what must never appear.
+    try std.testing.expect(!contains(rec.log.items, source));
+}
+
 test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" {
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };

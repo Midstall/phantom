@@ -64,12 +64,15 @@ const RenderText = struct {
         const p = self.para orelse return;
         // One run per line, stacked by the height of the lines above it. Each
         // run carries its own ascent, so a backend that places a baseline does
-        // not have to know the paragraph exists.
+        // not have to know the paragraph exists. The run's text is that one
+        // line's slice, not the whole paragraph: a backend that draws from
+        // `text` rather than `glyphs` (the DOM backend) would otherwise paint
+        // the full paragraph on every line and overflow the box it is in.
         var y = offset.y;
         for (p.lines) |l| {
             cv.drawText(.{
                 .glyphs = l.glyphs,
-                .text = self.text,
+                .text = self.text[l.start..l.end],
                 .font = @ptrCast(self.font),
                 .size = self.physical_size,
                 .color = self.color,
@@ -403,6 +406,32 @@ test "a wrapping Text breaks to the width it was given and grows taller instead 
     for (p.lines) |l| try std.testing.expect(l.width <= 120);
     // Taller than one line, which is the whole point of wrapping.
     try std.testing.expect(p.height > p.lines[0].height);
+}
+
+test "a wrapping Text's three runs hold three different lines, not the whole paragraph three times" {
+    const gpa = std.testing.allocator;
+    var h = try phantom.testing.mount(gpa, blk: {
+        const t = Text{ .text = "one two three", .size = 16, .wrap = true };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    // Narrow enough that each word lands on its own line under this font.
+    h.viewport = .{ .width = 55, .height = 400 };
+    try h.pump();
+
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(gpa);
+    for (h.canvas.list.primitives.items) |prim| {
+        if (prim == .text) try texts.append(gpa, prim.text.text);
+    }
+    try std.testing.expectEqual(@as(usize, 3), texts.items.len);
+    // Each run is its own line, none of them the full paragraph: the DOM
+    // backend sets an element's text content straight from this field, so a
+    // run holding the whole string would spill that whole string into every
+    // line's box.
+    for (texts.items) |t| try std.testing.expect(t.len < "one two three".len);
+    try std.testing.expect(!std.mem.eql(u8, texts.items[0], texts.items[1]));
+    try std.testing.expect(!std.mem.eql(u8, texts.items[1], texts.items[2]));
 }
 
 test "a wrapping Text stacks its lines down the box rather than drawing them on top of each other" {

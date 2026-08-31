@@ -9,6 +9,12 @@ pub const Line = struct {
     width: f32,
     height: f32,
     ascent: f32,
+    /// The byte range of this line in the text passed to `layoutLine`.
+    /// `layoutParagraph` shifts this to the byte range in the whole paragraph,
+    /// so a caller can slice the source text for exactly this line, and never
+    /// has to hand a backend the whole paragraph for one line's run.
+    start: usize,
+    end: usize,
     pub fn deinit(self: *Line, gpa: std.mem.Allocator) void {
         gpa.free(self.glyphs);
         self.* = undefined;
@@ -50,6 +56,8 @@ pub fn layoutLine(
     return .{
         .glyphs = try glyphs.toOwnedSlice(gpa),
         .width = pen_x,
+        .start = 0,
+        .end = text.len,
         .height = switch (metrics) {
             // Through `Font.lineHeight` rather than repeating the subtraction,
             // so the line box a caller can ASK for and the one a run actually
@@ -239,6 +247,11 @@ pub fn layoutParagraph(
         const b = nextBreak(font, text, pos, size, metrics, max_width);
         var line = try layoutLine(gpa, font, text[pos..b.end], size, metrics);
         errdefer line.deinit(gpa);
+        // `layoutLine` measured a slice starting at zero; shift its range to
+        // where that slice actually sits in the paragraph, so `line.start` and
+        // `line.end` slice the paragraph, not just the fragment it saw.
+        line.start += pos;
+        line.end += pos;
         try lines.append(gpa, line);
         if (b.next >= text.len) break;
         pos = b.next;
@@ -386,6 +399,66 @@ test "empty text is one empty line, so it occupies a row like any other" {
     try std.testing.expectEqual(@as(usize, 1), p.lines.len);
     try std.testing.expectEqual(@as(usize, 0), p.lines[0].glyphs.len);
     try std.testing.expectEqual(@as(f32, 20), p.height);
+}
+
+test "a line's byte range slices back to exactly that line's text" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    const text = "abc def";
+    var p = try layoutParagraph(gpa, &font, text, 14, m, 50);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), p.lines.len);
+    try std.testing.expectEqualStrings("abc", text[p.lines[0].start..p.lines[0].end]);
+    try std.testing.expectEqualStrings("def", text[p.lines[1].start..p.lines[1].end]);
+}
+
+test "an unwrapped paragraph's one line covers the whole source string" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    const text = "a long line of words";
+    var p = try layoutParagraph(gpa, &font, text, 14, m, 0);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), p.lines.len);
+    try std.testing.expectEqualStrings(text, text[p.lines[0].start..p.lines[0].end]);
+}
+
+test "three wrapped lines' byte ranges concatenate back to the source, minus the spaces they broke on" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    const text = "one two three";
+    var p = try layoutParagraph(gpa, &font, text, 14, m, 55);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), p.lines.len);
+    var rebuilt: std.ArrayList(u8) = .empty;
+    defer rebuilt.deinit(gpa);
+    for (p.lines, 0..) |l, i| {
+        if (i > 0) try rebuilt.append(gpa, ' ');
+        try rebuilt.appendSlice(gpa, text[l.start..l.end]);
+    }
+    try std.testing.expectEqualStrings(text, rebuilt.items);
+    // Each line's slice is a real fragment of the paragraph, not the whole thing.
+    for (p.lines) |l| try std.testing.expect(l.end - l.start < text.len);
+}
+
+test "a paragraph's UTF-8 line range slices on byte offsets, not codepoint counts" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    // Each han character is three UTF-8 bytes but one column under mono metrics
+    // (wcwidth treats it as narrow here), so a byte-range bug that assumed one
+    // byte per codepoint would slice mid-character and corrupt the text.
+    const text = "\u{4E2D}\u{6587} ab";
+    var p = try layoutParagraph(gpa, &font, text, 14, m, 1000);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), p.lines.len);
+    try std.testing.expectEqualStrings(text, text[p.lines[0].start..p.lines[0].end]);
 }
 
 test "proportional wrapping measures with the font, not with a fixed column" {
