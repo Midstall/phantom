@@ -407,9 +407,12 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     return step;
 }
 
-// Inline static server scripts. Each serves a directory on port 8080, bound to
-// loopback only: this is a dev server, and a request path is remote input, not
-// something to trust. All three read the dir from the PHANTOM_SERVE_DIR env var
+// Inline static server scripts. Each serves a directory on port 8080. A request
+// path is remote input, so each script confines every read to the serve root and
+// answers 404 for a path that escapes it. The bind address comes from
+// PHANTOM_SERVE_HOST and defaults to every interface, so a developer can open the
+// site from a second machine on the same network. Set it to 127.0.0.1 for
+// loopback only. All three read the dir from the PHANTOM_SERVE_DIR env var
 // (node/bun `-e` eval mode does not expose a positional arg at a stable argv
 // index, so an env var is used uniformly).
 // Content-Type: .wasm -> application/wasm, .js -> text/javascript,
@@ -428,6 +431,7 @@ const node_serve_js =
     \\const dir = process.env.PHANTOM_SERVE_DIR;
     \\if (!dir) { process.stderr.write('PHANTOM_SERVE_DIR not set\n'); process.exit(1); }
     \\const root = path.resolve(dir);
+    \\const host = process.env.PHANTOM_SERVE_HOST || '0.0.0.0';
     \\function mime(p) {
     \\  if (p.endsWith('.wasm')) return 'application/wasm';
     \\  if (p.endsWith('.js')) return 'text/javascript';
@@ -451,7 +455,7 @@ const node_serve_js =
     \\    res.writeHead(200, { 'Content-Type': mime(file) });
     \\    res.end(data);
     \\  });
-    \\}).listen(8080, '127.0.0.1', function() {
+    \\}).listen(8080, host, function() {
     \\  process.stdout.write('phantom serve: http://localhost:8080 serving ' + dir + '\n');
     \\});
 ;
@@ -467,9 +471,10 @@ const bun_serve_js =
     \\  if (p.endsWith('.html')) return 'text/html';
     \\  return 'application/octet-stream';
     \\}
+    \\const host = process.env.PHANTOM_SERVE_HOST || '0.0.0.0';
     \\const server = Bun.serve({
     \\  port: 8080,
-    \\  hostname: '127.0.0.1',
+    \\  hostname: host,
     \\  async fetch(req) {
     \\    const url = new URL(req.url);
     \\    let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
@@ -498,7 +503,8 @@ const deno_serve_js =
     \\  if (p.endsWith('.html')) return 'text/html';
     \\  return 'application/octet-stream';
     \\}
-    \\Deno.serve({ port: 8080, hostname: '127.0.0.1' }, async function(req) {
+    \\const host = Deno.env.get('PHANTOM_SERVE_HOST') || '0.0.0.0';
+    \\Deno.serve({ port: 8080, hostname: host }, async function(req) {
     \\  const url = new URL(req.url);
     \\  let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
     \\  if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
@@ -531,7 +537,7 @@ fn addServeStep(b: *std.Build, dist_dir: []const u8, name: []const u8, app_step:
     } else if (b.findProgram(&.{"deno"}, &.{}) catch null) |deno_bin| {
         // --allow-env is required: the deno script reads PHANTOM_SERVE_DIR via
         // Deno.env.get, which throws PermissionDenied without it.
-        const r = b.addSystemCommand(&.{ deno_bin, "run", "--allow-net", "--allow-read", "--allow-env=PHANTOM_SERVE_DIR", "-" });
+        const r = b.addSystemCommand(&.{ deno_bin, "run", "--allow-net", "--allow-read", "--allow-env=PHANTOM_SERVE_DIR,PHANTOM_SERVE_HOST", "-" });
         r.setStdIn(.{ .bytes = deno_serve_js });
         run = r;
     }
