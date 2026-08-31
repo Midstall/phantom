@@ -46,6 +46,11 @@ pub const LocalizedText = struct {
 
 pub const Icon = struct { path: std.Build.LazyPath, size: u32 };
 
+/// How a route appears in the address bar. `.hash` works on any static host
+/// with no configuration. `.path` needs a host that serves the application
+/// for an unknown path, or the copies that `prerender_routes` writes.
+pub const UrlStrategy = enum { hash, path };
+
 pub const AppOptions = struct {
     id: []const u8,
     /// The binary name. Defaults to the last dotted segment of `id`. Set this
@@ -64,6 +69,7 @@ pub const AppOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     web_runtime: WebRuntime = .auto,
+    url_strategy: UrlStrategy = .hash,
 };
 
 /// The binary name for an app. Borrows both arguments and returns a slice into

@@ -179,6 +179,20 @@ pub const Router = struct {
             s.routes = config.routes;
             s.not_found = config.not_found;
             s.handle = .{ .state = s };
+            // The outermost router wins: mounting runs top down, so the first
+            // one to arrive here finds the slot empty. A router nested inside
+            // it finds the slot already taken and leaves it alone.
+            if (s.base.element.owner.router == null) s.base.element.owner.router = s.handle;
+        }
+
+        /// Releases the owner's router slot, and only when this router is the
+        /// one holding it. Called before the State is freed, so a stale
+        /// handle to freed memory can never survive a router that goes away.
+        pub fn dispose(s: *State) void {
+            const owner = s.base.element.owner;
+            if (owner.router) |h| {
+                if (h.state == s) owner.router = null;
+            }
         }
 
         pub fn didUpdateWidget(s: *State, config: *const Router) !void {
@@ -570,4 +584,73 @@ test "a RouteLink rebuilt after the build arena resets still navigates on tap" {
     h.tapAt(centerOfRoot(&h));
 
     try std.testing.expectEqualStrings("/gallery", state.location());
+}
+
+// ---------------------------------------------------------------------------
+// owner.router slot tests
+// ---------------------------------------------------------------------------
+
+fn nestedRouterPage(b: *BuildContext) Widget {
+    const inner = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    return b.new(inner).widget();
+}
+
+const outer_routes = [_]Route{
+    .{ .path = "/", .build = nestedRouterPage },
+};
+
+test "a mounted router claims the owner's router slot" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    const handle = h.owner.router orelse return error.NoRouterClaimed;
+    try std.testing.expect(handle.state == state);
+}
+
+test "a router nested inside another leaves the outer router's claim on the slot" {
+    // find.byType walks pre-order, so this returns the OUTER router's state:
+    // it is the one that matches Router's type name first in the tree.
+    const r = Router{ .routes = &outer_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    try h.pump();
+    const outer_state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    const handle = h.owner.router orelse return error.NoRouterClaimed;
+    try std.testing.expect(handle.state == outer_state);
+}
+
+const RouterToggle = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        show: bool = true,
+
+        pub fn build(s: *@This(), b: *BuildContext) anyerror!Widget {
+            if (!s.show) return b.new(phantom.Text{ .text = "gone" }).widget();
+            const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+            return b.new(r).widget();
+        }
+    };
+
+    pub fn widget(self: *const RouterToggle) Widget {
+        return phantom.StatefulWidget(RouterToggle, self);
+    }
+};
+
+fn hideRouter(s: *RouterToggle.State) void {
+    s.show = false;
+}
+
+test "unmounting the router that holds the owner's slot releases it" {
+    var toggle = RouterToggle{};
+    var h = try phantom.testing.mount(std.testing.allocator, toggle.widget());
+    defer h.deinit();
+    try h.pump();
+    try std.testing.expect(h.owner.router != null);
+
+    const toggle_state = try h.stateOf(phantom.testing.find.byType(RouterToggle), RouterToggle.State);
+    phantom.setState(toggle_state, hideRouter);
+    try h.pump();
+
+    try std.testing.expect(h.owner.router == null);
 }

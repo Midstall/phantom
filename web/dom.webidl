@@ -22,8 +22,21 @@ interface Document {
   Node appendChild(Node node);
 };
 
+interface Location {
+  readonly attribute DOMString pathname;
+  attribute DOMString hash;
+};
+
+interface History {
+  undefined pushState(DOMString data, DOMString title, DOMString url);
+  undefined replaceState(DOMString data, DOMString title, DOMString url);
+};
+
 interface Window {
   readonly attribute unsigned long innerWidth;
   readonly attribute unsigned long innerHeight;
   readonly attribute double devicePixelRatio;
+  readonly attribute Location location;
+  readonly attribute History history;
+  undefined open(DOMString url, DOMString target);
 };

@@ -64,6 +64,7 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         phantom.Root.plain(hello.root),
         .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) },
         @floatCast(dpr),
+        .hash,
     ) catch return 0;
     return @intFromPtr(app);
 }

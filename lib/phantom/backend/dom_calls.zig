@@ -31,6 +31,12 @@ pub const DomOps = struct {
     clear_children: *const fn (ctx: *anyopaque, node: u32) void,
     body: u32,
     head: u32,
+    /// Opens a URL in a new tab. Null on a host that has no browser.
+    open_url: ?*const fn (ctx: *anyopaque, url: []const u8) void = null,
+    /// Writes the current route into `buf` and returns the written part.
+    read_location: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
+    /// Puts `path` in the address bar without loading a new page.
+    write_location: ?*const fn (ctx: *anyopaque, path: []const u8) void = null,
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -166,6 +172,11 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                         try rules.appendSlice(gpa, rule);
                     }
                 }
+                // A pointer cursor is the browser's own affordance for "this
+                // responds to a tap", so every interactive rectangle gets one.
+                const cursor_rule = try std.fmt.allocPrint(gpa, ".pb{d}{{cursor:pointer}}", .{c});
+                defer gpa.free(cursor_rule);
+                try rules.appendSlice(gpa, cursor_rule);
             }
         },
         .image => |img| {
@@ -478,6 +489,29 @@ test "dom_calls: interactive fill rrect records class=pb0 and a style element wi
     // A style element must be created and its textContent must contain the hover rule.
     try std.testing.expect(contains(rec.log.items, "createElement(style)"));
     try std.testing.expect(contains(rec.log.items, ".pb0:hover{background:"));
+}
+
+test "an interactive rectangle gets a pointer cursor and a plain one does not" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    // One rectangle with a hover colour, and one without.
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(0, 0, 1),
+        .hover_color = geometry.Color.rgb(0, 0, 0.5),
+    } });
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 20, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+    } });
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0));
+    try std.testing.expect(contains(rec.log.items, ".pb0{cursor:pointer}"));
+    try std.testing.expect(!contains(rec.log.items, ".pb1"));
 }
 
 test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" {

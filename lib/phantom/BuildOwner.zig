@@ -52,6 +52,12 @@ focus: ?*@import("focus.zig").FocusManager = null,
 /// Filled in by the backend that has a browser. Every other backend leaves it
 /// empty, and the router then keeps its history in memory only.
 platform: @import("platform.zig").Platform = .{},
+/// The router that owns the address of the page, or null when the tree has
+/// none. `Router.State.initState` claims this slot only when it is empty, so
+/// the outermost router wins: mounting runs from the top down, so the
+/// outermost one arrives first. A nested router keeps its own history and
+/// leaves the address bar alone.
+router: ?@import("router.zig").RouterHandle = null,
 /// Timers and per-frame callbacks for this owner's tree. Ticked by whichever
 /// loop is running: App.run natively, the browser animation frame on web.
 scheduler: Scheduler = .{},

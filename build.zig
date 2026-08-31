@@ -130,63 +130,117 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // Generated web entry: implements DomOps via the generated dom module and passes
     // them to phantom.web.init. Returns the *WebApp as a usize so JS holds the pointer.
     // dom_ctx is module-level in the app-glue entry (single wasm instance, acceptable here).
-    const entry_src =
+    const entry_src = b.fmt(
         \\const std = @import("std");
         \\const phantom = @import("phantom");
         \\const dom = @import("dom");
+        \\const webidl = @import("webidl");
         \\const app_root = @import("app_root");
         \\
-        \\const DomCtx = struct { doc: u32 };
+        \\const strategy_is_hash = {s};
+        \\
+        \\const DomCtx = struct {{ doc: u32, window: u32 }};
         \\var dom_ctx: DomCtx = undefined;
         \\
-        \\fn createElement(ctx: *anyopaque, tag: []const u8) u32 {
+        \\fn createElement(ctx: *anyopaque, tag: []const u8) u32 {{
         \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{ .handle = c.doc };
+        \\    const doc = dom.Document{{ .handle = c.doc }};
         \\    return doc.createElement(tag).handle;
-        \\}
+        \\}}
         \\// An `svg` made by createElement lands in the HTML namespace, where a
         \\// browser lays it out and never paints it. Only the namespaced call
         \\// reaches the SVG namespace, so icons need this one.
-        \\fn createElementNS(ctx: *anyopaque, ns: []const u8, tag: []const u8) u32 {
+        \\fn createElementNS(ctx: *anyopaque, ns: []const u8, tag: []const u8) u32 {{
         \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{ .handle = c.doc };
+        \\    const doc = dom.Document{{ .handle = c.doc }};
         \\    return doc.createElementNS(ns, tag).handle;
-        \\}
-        \\fn createTextNode(ctx: *anyopaque, data: []const u8) u32 {
+        \\}}
+        \\fn createTextNode(ctx: *anyopaque, data: []const u8) u32 {{
         \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{ .handle = c.doc };
+        \\    const doc = dom.Document{{ .handle = c.doc }};
         \\    return doc.createTextNode(data).handle;
-        \\}
-        \\fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {
+        \\}}
+        \\fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {{
         \\    _ = ctx;
-        \\    const el = dom.Element{ .handle = node };
+        \\    const el = dom.Element{{ .handle = node }};
         \\    el.setAttribute(name, value);
-        \\}
-        \\fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
+        \\}}
+        \\fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {{
         \\    _ = ctx;
-        \\    const el = dom.Element{ .handle = node };
+        \\    const el = dom.Element{{ .handle = node }};
         \\    el.set_textContent(textv);
-        \\}
-        \\fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
+        \\}}
+        \\fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {{
         \\    _ = ctx;
-        \\    const el = dom.Element{ .handle = parent };
-        \\    _ = el.appendChild(dom.Node{ .handle = child });
-        \\}
-        \\fn clearChildren(ctx: *anyopaque, node: u32) void {
+        \\    const el = dom.Element{{ .handle = parent }};
+        \\    _ = el.appendChild(dom.Node{{ .handle = child }});
+        \\}}
+        \\fn clearChildren(ctx: *anyopaque, node: u32) void {{
         \\    _ = ctx;
-        \\    const el = dom.Element{ .handle = node };
+        \\    const el = dom.Element{{ .handle = node }};
         \\    el.set_innerHTML("");
-        \\}
+        \\}}
         \\
-        \\export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
-        \\    const win = dom.Window{ .handle = window_handle };
+        \\// Reads the address bar into buf, according to the build's url strategy. A
+        \\// hash strategy trims the leading '#' and reads an empty hash as "/", so a
+        \\// fresh page with no hash still resolves to the root route.
+        \\fn currentPath(win: dom.Window, buf: []u8) []const u8 {{
+        \\    const loc = win.get_location();
+        \\    const raw = if (strategy_is_hash) loc.get_hash() else loc.get_pathname();
+        \\    defer webidl.rt.freeStr(raw);
+        \\    var s = raw;
+        \\    if (strategy_is_hash) {{
+        \\        if (s.len > 0 and s[0] == '#') s = s[1..];
+        \\        if (s.len == 0) s = "/";
+        \\    }}
+        \\    const n = @min(s.len, buf.len);
+        \\    @memcpy(buf[0..n], s[0..n]);
+        \\    return buf[0..n];
+        \\}}
+        \\
+        \\fn openUrl(ctx: *anyopaque, url: []const u8) void {{
+        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
+        \\    const win = dom.Window{{ .handle = c.window }};
+        \\    win.open(url, "_blank");
+        \\}}
+        \\
+        \\fn readLocation(ctx: *anyopaque, buf: []u8) []const u8 {{
+        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
+        \\    const win = dom.Window{{ .handle = c.window }};
+        \\    return currentPath(win, buf);
+        \\}}
+        \\
+        \\// Puts path in the address bar. Skipped when the bar already shows it: a
+        \\// browser-driven back or forward already moved the address bar before this
+        \\// runs (through locationChanged below), and writing again would push a
+        \\// duplicate history entry that turns one back-button press into two.
+        \\fn writeLocation(ctx: *anyopaque, path: []const u8) void {{
+        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
+        \\    const win = dom.Window{{ .handle = c.window }};
+        \\    var cur_buf: [phantom.router.max_path]u8 = undefined;
+        \\    const cur = currentPath(win, &cur_buf);
+        \\    if (std.mem.eql(u8, cur, path)) return;
+        \\    const hist = win.get_history();
+        \\    if (strategy_is_hash) {{
+        \\        var url_buf: [phantom.router.max_path + 1]u8 = undefined;
+        \\        const n = @min(path.len, url_buf.len - 1);
+        \\        url_buf[0] = '#';
+        \\        @memcpy(url_buf[1 .. 1 + n], path[0..n]);
+        \\        hist.pushState("", "", url_buf[0 .. 1 + n]);
+        \\    }} else {{
+        \\        hist.pushState("", "", path);
+        \\    }}
+        \\}}
+        \\
+        \\export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {{
+        \\    const win = dom.Window{{ .handle = window_handle }};
         \\    const vw: u32 = win.get_innerWidth();
         \\    const vh: u32 = win.get_innerHeight();
         \\    const dpr: f64 = win.get_devicePixelRatio();
-        \\    dom_ctx = .{ .doc = doc_handle };
-        \\    const _doc = dom.Document{ .handle = doc_handle };
+        \\    dom_ctx = .{{ .doc = doc_handle, .window = window_handle }};
+        \\    const _doc = dom.Document{{ .handle = doc_handle }};
         \\    const head = _doc.get_head().handle;
-        \\    const ops = phantom.backend.dom_calls.DomOps{
+        \\    const ops = phantom.backend.dom_calls.DomOps{{
         \\        .ctx = &dom_ctx,
         \\        .create_element = createElement,
         \\        .create_element_ns = createElementNS,
@@ -197,30 +251,46 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\        .clear_children = clearChildren,
         \\        .body = body_handle,
         \\        .head = head,
-        \\    };
+        \\        .open_url = openUrl,
+        \\        .read_location = readLocation,
+        \\        .write_location = writeLocation,
+        \\    }};
+        \\    const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
         \\    const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root),
-        \\        .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }, @floatCast(dpr)) catch return 0;
+        \\        .{{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }}, @floatCast(dpr), strategy) catch return 0;
         \\    return @intFromPtr(app);
-        \\}
-        \\export fn dispatchTap(app: usize, x: f32, y: f32) void {
+        \\}}
+        \\export fn dispatchTap(app: usize, x: f32, y: f32) void {{
         \\    if (app == 0) return;
         \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
         \\    a.dispatchTap(x, y);
-        \\}
-        \\export fn resize(app: usize, w: u32, h: u32, dpr: f64) void {
+        \\}}
+        \\export fn resize(app: usize, w: u32, h: u32, dpr: f64) void {{
         \\    if (app == 0) return;
         \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    a.resize(.{ .width = @floatFromInt(w), .height = @floatFromInt(h) }, @floatCast(dpr));
-        \\}
+        \\    a.resize(.{{ .width = @floatFromInt(w), .height = @floatFromInt(h) }}, @floatCast(dpr));
+        \\}}
         \\// wall_ms is Date.now (settable, Unix epoch). mono_ms is the animation
         \\// frame timestamp (monotonic, page time origin). Both are needed: the
         \\// bar shows a time of day, the scheduler arms deadlines.
-        \\export fn tick(app: usize, wall_ms: f64, mono_ms: f64) void {
+        \\export fn tick(app: usize, wall_ms: f64, mono_ms: f64) void {{
         \\    if (app == 0) return;
         \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
         \\    a.tick(wall_ms, mono_ms);
-        \\}
-    ;
+        \\}}
+        \\// The browser moved back or forward. The address bar already shows the new
+        \\// location, so this reads it back and tells the tree, rather than taking the
+        \\// new path as a string argument: a string argument would need the JS host to
+        \\// write into wasm memory, and reading the location back through the same
+        \\// DomOps hook the tree already uses needs no new plumbing.
+        \\export fn locationChanged(app: usize) void {{
+        \\    if (app == 0) return;
+        \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
+        \\    var buf: [phantom.router.max_path]u8 = undefined;
+        \\    const path = a.owner.platform.readLocation(&buf) orelse return;
+        \\    a.navigate(path);
+        \\}}
+    , .{if (opts.url_strategy == .hash) "true" else "false"});
     const entry = b.addWriteFiles().add("main.zig", entry_src);
 
     const wasm = b.addExecutable(.{
@@ -235,6 +305,9 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     wasm.rdynamic = true;
     wasm.root_module.addImport("phantom", phantom_wasm);
     wasm.root_module.addImport("dom", dom_client);
+    // The generated entry frees the string `dom`'s getters hand back, so it
+    // reaches the runtime the same way the generated module itself does.
+    wasm.root_module.addImport("webidl", webidl_dep.module("webidl"));
     wasm.root_module.addImport("app_root", app_mod);
 
     // JS runtime strategy (detected at build time):
@@ -527,6 +600,10 @@ fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const 
         \\      const windowHandle = host.intern(window);
         \\      const app = instance.exports.init(documentHandle, bodyHandle, windowHandle);
         \\      document.body.addEventListener("click", (e) => instance.exports.dispatchTap(app, e.clientX, e.clientY));
+        \\      // The back/forward buttons move the address bar and then fire this,
+        \\      // with no string to pass in: the wasm side reads the new location
+        \\      // back itself, so the JS host never allocates inside the module.
+        \\      window.addEventListener("popstate", () => instance.exports.locationChanged(app));
         \\      const onResize = () => instance.exports.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio);
         \\      window.addEventListener("resize", onResize);
         \\      matchMedia(`(resolution: ${{window.devicePixelRatio}}dppx)`).addEventListener("change", onResize);

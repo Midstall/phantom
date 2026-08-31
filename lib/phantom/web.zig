@@ -79,7 +79,34 @@ pub const WebApp = struct {
         self.owner.setActiveViewMetrics(.{ .size = logical, .dpr = dpr, .text_scale = 1.0 });
         self.render();
     }
+
+    /// The browser moved back or forward. The address bar already holds the new
+    /// path, so this only tells the tree. It does nothing when the tree has no
+    /// router, which is every application that does not use one.
+    pub fn navigate(self: *WebApp, path: []const u8) void {
+        const h = self.owner.router orelse return;
+        h.replace(path);
+        self.render();
+    }
 };
+
+fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    const f = app.ops.open_url orelse return;
+    f(app.ops.ctx, url);
+}
+
+fn readLocationThunk(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    const f = app.ops.read_location orelse return buf[0..0];
+    return f(app.ops.ctx, buf);
+}
+
+fn writeLocationThunk(ctx: *anyopaque, path: []const u8) void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    const f = app.ops.write_location orelse return;
+    f(app.ops.ctx, path);
+}
 
 fn webNow(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
     const app: *WebApp = @ptrCast(@alignCast(userdata.?));
@@ -135,6 +162,7 @@ pub fn init(
     root: phantom.Root,
     logical_viewport: phantom.LogicalSize,
     device_pixel_ratio: f32,
+    strategy: phantom.UrlStrategy,
 ) !*WebApp {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -171,6 +199,15 @@ pub fn init(
     // handlers of any unmounted hovered/pressed render object.
     owner.dispatcher = &app.dispatcher;
     owner.io = webIo(app);
+    // Wired before the tree mounts, so a Router's first `sync` (from its
+    // initial location) already reaches the address bar.
+    owner.platform = .{
+        .ctx = app,
+        .open_url = openUrlThunk,
+        .read_location = readLocationThunk,
+        .write_location = writeLocationThunk,
+        .strategy = strategy,
+    };
 
     var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = owner };
     const root_widget = root.call(&bctx);
