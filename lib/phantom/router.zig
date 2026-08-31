@@ -262,6 +262,11 @@ pub const Router = struct {
             // the framework has no way to pop an entry out of the browser's
             // own history, only to push a new one or overwrite the top.
             s.sync(.replace);
+            // A pop reaches a different route, so the next frame starts that
+            // route at the top. `push` and `replace` say the same. Without
+            // this an application's own back button would leave the reader
+            // part way down the page they came back to.
+            s.base.element.owner.route_changed = true;
             phantom.markNeedsBuild(s);
             return true;
         }
@@ -819,4 +824,22 @@ test "unmounting the router that holds the owner's slot releases it" {
     try h.pump();
 
     try std.testing.expect(h.owner.router == null);
+}
+
+test "a pop marks the route as changed, so the page it returns to starts at the top" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+
+    state.push("/gallery");
+    try h.pump();
+    // The render after a navigation clears the flag, which is what the web
+    // backend does, so clear it here to see what the pop alone sets.
+    h.owner.route_changed = false;
+
+    try std.testing.expect(state.pop());
+    // An application's own back button reaches a different route, so the
+    // reader belongs at the top of it, not part way down the last one.
+    try std.testing.expect(h.owner.route_changed);
 }
