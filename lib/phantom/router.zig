@@ -163,7 +163,12 @@ pub const Router = struct {
     pub const State = struct {
         base: phantom.StateBase = .{},
         stack: Stack = undefined,
+        /// Re-read on every update. A route table built fresh each frame with
+        /// `b.newSlice` stays valid this way, because the slice would
+        /// otherwise point into a build arena that is reset once the frame
+        /// ends.
         routes: []const Route = &.{},
+        /// Re-read on every update, for the same reason as `routes`.
         not_found: *const fn (*BuildContext) Widget = undefined,
         /// Set by `initState`, so a config with a path that is too long fails
         /// once at mount and the tree still builds.
@@ -174,6 +179,11 @@ pub const Router = struct {
             s.routes = config.routes;
             s.not_found = config.not_found;
             s.handle = .{ .state = s };
+        }
+
+        pub fn didUpdateWidget(s: *State, config: *const Router) !void {
+            s.routes = config.routes;
+            s.not_found = config.not_found;
         }
 
         pub fn location(s: *const State) []const u8 {
@@ -216,6 +226,11 @@ pub const Router = struct {
             const child = for (s.routes) |r| {
                 if (std.mem.eql(u8, r.path, here)) break r.build(b);
             } else blk: {
+                // Reported on every build while the location stays unmatched,
+                // not only once on the transition into it. Per-frame
+                // diagnostics are the norm in this codebase, and a caller
+                // watching the sink needs the fault to still be there on the
+                // frame it checks, not only on the frame it started.
                 b.owner.sink.report(.route_not_found, here);
                 break :blk s.not_found(b);
             };
@@ -255,7 +270,12 @@ pub const RouteLink = struct {
 
         fn tap(ctx: *anyopaque) void {
             const s: *State = @ptrCast(@alignCast(ctx));
-            const h = s.handle orelse return;
+            const h = s.handle orelse {
+                // A soft failure still needs a report, so a link left outside
+                // a Router does not fail in silence.
+                s.base.sink().report(.route_rejected, "RouteLink has no Router above it");
+                return;
+            };
             h.push(s.target.slice());
         }
 
@@ -407,4 +427,82 @@ test "a path longer than the buffer is refused and the location does not change"
     try h.pump();
     try std.testing.expectEqualStrings("/", state.location());
     try h.expectFault(.route_rejected);
+}
+
+// ---------------------------------------------------------------------------
+// RouterScope, Router.of and RouteLink tests
+// ---------------------------------------------------------------------------
+
+fn homeWithLink(b: *BuildContext) Widget {
+    const box = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    return b.new(RouteLink{ .to = "/gallery", .child = b.new(box).widget() }).widget();
+}
+
+const link_routes = [_]Route{
+    .{ .path = "/", .build = homeWithLink },
+    .{ .path = "/gallery", .build = galleryPage },
+};
+
+/// The point at the center of the tree's single render object, in physical
+/// coordinates. `Router`, `RouterScope` and `RouteLink` carry no render
+/// object of their own, so the walk from the root lands on the
+/// `GestureDetector` that `RouteLink` builds.
+fn centerOfRoot(h: *phantom.testing.Harness) phantom.PhysicalOffset {
+    const ro = h.root.renderObject().?;
+    return .{
+        .x = ro.origin.x + ro.size.width * 0.5,
+        .y = ro.origin.y + ro.size.height * 0.5,
+    };
+}
+
+test "a RouteLink mounted under a Router, when tapped, changes the router's location to its target" {
+    const r = Router{ .routes = &link_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    try h.pump();
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    try std.testing.expectEqualStrings("/", state.location());
+
+    h.tapAt(centerOfRoot(&h));
+
+    try std.testing.expectEqualStrings("/gallery", state.location());
+    try h.expectNoFaults();
+}
+
+test "Router.of returns null when there is no router above the build point" {
+    var link = RouteLink{ .to = "/gallery", .child = (phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) }).widget() };
+    var h = try phantom.testing.mount(std.testing.allocator, link.widget());
+    defer h.deinit();
+    try h.pump();
+    const state = try h.stateOf(phantom.testing.find.byType(RouteLink), RouteLink.State);
+    try std.testing.expect(state.handle == null);
+}
+
+test "Router.of returns a handle whose location matches the router above it" {
+    const r = Router{ .routes = &link_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    try h.pump();
+    const router_state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    const link_state = try h.stateOf(phantom.testing.find.byType(RouteLink), RouteLink.State);
+    const handle = link_state.handle orelse return error.NoRouterHandle;
+    try std.testing.expectEqualStrings(router_state.location(), handle.location());
+}
+
+test "a RouteLink rebuilt after the build arena resets still navigates on tap" {
+    const r = Router{ .routes = &link_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+
+    // Two frames with an arena reset in between, matching the reset that
+    // `render` runs once a frame in `web.zig`. `RouteLink.State` never holds
+    // a pointer into that arena, so navigation must still work afterwards.
+    try h.pump();
+    _ = h.arena.reset(.retain_capacity);
+    try h.pump();
+
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    h.tapAt(centerOfRoot(&h));
+
+    try std.testing.expectEqualStrings("/gallery", state.location());
 }
