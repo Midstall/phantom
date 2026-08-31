@@ -21,6 +21,8 @@ pub const FaultCode = enum {
     route_not_found,
     /// A navigation was refused. The path was too long, or the history is full.
     route_rejected,
+    /// A link was tapped on a backend that cannot open a URL.
+    link_unsupported,
 };
 
 pub const Fault = struct {

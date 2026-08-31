@@ -49,6 +49,9 @@ dispatcher: ?*input_mod.Dispatcher = null,
 /// Set by the entry point that owns a focus manager. Null when nothing routes keys,
 /// which is every backend except the terminal today.
 focus: ?*@import("focus.zig").FocusManager = null,
+/// Filled in by the backend that has a browser. Every other backend leaves it
+/// empty, and the router then keeps its history in memory only.
+platform: @import("platform.zig").Platform = .{},
 /// Timers and per-frame callbacks for this owner's tree. Ticked by whichever
 /// loop is running: App.run natively, the browser animation frame on web.
 scheduler: Scheduler = .{},

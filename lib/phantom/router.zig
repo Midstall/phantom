@@ -215,10 +215,11 @@ pub const Router = struct {
             phantom.markNeedsBuild(s);
         }
 
-        /// Task 4 fills this in with the browser location. It is a separate
-        /// method so the navigation methods above never grow a second concern.
+        /// Publishes the top of the stack to the address bar. A backend with
+        /// no location hook leaves the history in memory, which is what the
+        /// terminal and the window backends want.
         fn sync(s: *State) void {
-            _ = s;
+            s.base.element.owner.platform.writeLocation(s.stack.current());
         }
 
         pub fn build(s: *State, b: *BuildContext) anyerror!Widget {

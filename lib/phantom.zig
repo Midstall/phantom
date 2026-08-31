@@ -181,6 +181,12 @@ pub const Route = router.Route;
 pub const RouteLink = router.RouteLink;
 pub const RouterHandle = router.RouterHandle;
 
+pub const platform = @import("phantom/platform.zig");
+pub const Platform = platform.Platform;
+pub const UrlStrategy = platform.UrlStrategy;
+pub const link_widget = @import("phantom/widgets/link.zig");
+pub const Link = link_widget.Link;
+
 pub const view = @import("phantom/view.zig");
 pub const View = view.View;
 pub const MediaQueryData = view.MediaQueryData;
@@ -274,4 +280,6 @@ test {
     _ = @import("phantom/tui/kitty_gfx.zig");
     _ = @import("phantom/backend/tui_pixels.zig");
     _ = @import("phantom/router.zig");
+    _ = @import("phantom/platform.zig");
+    _ = @import("phantom/widgets/link.zig");
 }
