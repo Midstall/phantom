@@ -429,6 +429,59 @@ test "a path longer than the buffer is refused and the location does not change"
     try h.expectFault(.route_rejected);
 }
 
+fn atlasPage(b: *BuildContext) Widget {
+    return b.new(phantom.Text{ .text = "atlas" }).widget();
+}
+
+const swapped_routes = [_]Route{
+    .{ .path = "/", .build = homePage },
+    .{ .path = "/gallery", .build = atlasPage },
+};
+
+/// Hands a Router a fresh route table on every rebuild. The harness mounts a
+/// tree once and cannot swap the root's own config, so this wrapper stands in
+/// for the parent a real app would use to change a route table at runtime.
+const RouteTableSwitcher = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        use_swapped: bool = false,
+
+        pub fn build(s: *@This(), b: *BuildContext) anyerror!Widget {
+            const r = Router{
+                .routes = if (s.use_swapped) &swapped_routes else &test_routes,
+                .initial = "/gallery",
+                .not_found = missingPage,
+            };
+            return b.new(r).widget();
+        }
+    };
+
+    pub fn widget(self: *const RouteTableSwitcher) Widget {
+        return phantom.StatefulWidget(RouteTableSwitcher, self);
+    }
+};
+
+fn swapRouteTable(s: *RouteTableSwitcher.State) void {
+    s.use_swapped = true;
+}
+
+test "Router.State.didUpdateWidget refreshes the route table, so a rebuilt Router serves the new table's page for the same path" {
+    var switcher = RouteTableSwitcher{};
+    var h = try phantom.testing.mount(std.testing.allocator, switcher.widget());
+    defer h.deinit();
+    try h.pump();
+    // The old table's page renders first, so the swap below is a real change
+    // and not a check that passes no matter what the tree shows.
+    try h.expectHtml("gallery");
+
+    const switcher_state = try h.stateOf(phantom.testing.find.byType(RouteTableSwitcher), RouteTableSwitcher.State);
+    phantom.setState(switcher_state, swapRouteTable);
+    try h.pump();
+
+    try h.expectHtml("atlas");
+    try h.expectNoFaults();
+}
+
 // ---------------------------------------------------------------------------
 // RouterScope, Router.of and RouteLink tests
 // ---------------------------------------------------------------------------
@@ -476,6 +529,17 @@ test "Router.of returns null when there is no router above the build point" {
     try h.pump();
     const state = try h.stateOf(phantom.testing.find.byType(RouteLink), RouteLink.State);
     try std.testing.expect(state.handle == null);
+}
+
+test "a RouteLink with no Router above it reports route_rejected on tap" {
+    var link = RouteLink{ .to = "/gallery", .child = (phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) }).widget() };
+    var h = try phantom.testing.mount(std.testing.allocator, link.widget());
+    defer h.deinit();
+    try h.pump();
+
+    h.tapAt(centerOfRoot(&h));
+
+    try h.expectFault(.route_rejected);
 }
 
 test "Router.of returns a handle whose location matches the router above it" {
