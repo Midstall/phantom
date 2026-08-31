@@ -364,7 +364,12 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // Build + install the webidl-runtime JS and generate a matching index.html.
     const runtime_import = addRuntimeToStep(b, webidl_dep, dist_dir, step, opts.web_runtime);
 
-    const html_src = buildIndexHtml(b, wasm_name, runtime_import, opts.base_path);
+    // The tab title and description come from the app's own localized text,
+    // not the wasm binary's name, so a name with '&' or '"' cannot break the
+    // generated document.
+    const name_html = appmeta.xmlEscape(b.allocator, opts.name.default) catch @panic("oom");
+    const summary_html = appmeta.xmlEscape(b.allocator, opts.summary.default) catch @panic("oom");
+    const html_src = buildIndexHtml(b, wasm_name, runtime_import, opts.base_path, name_html, summary_html);
     const html_lp = b.addWriteFiles().add("index.html", html_src);
     step.dependOn(&b.addInstallFile(html_lp, b.fmt("{s}/index.html", .{dist_dir})).step);
 
@@ -650,8 +655,16 @@ fn addRuntimeToStep(
 /// where a relative asset resolves from: the same file is reachable as both
 /// "/gallery" and "/gallery/", and a browser resolves "./x" differently for
 /// each, so the page cannot rely on the request's shape and needs an
-/// explicit <base> instead.
-fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const u8, base_path: []const u8) []const u8 {
+/// explicit <base> instead. `name_html` and `summary_html` are already
+/// HTML-escaped by the caller.
+fn buildIndexHtml(
+    b: *std.Build,
+    wasm_name: []const u8,
+    runtime_import: []const u8,
+    base_path: []const u8,
+    name_html: []const u8,
+    summary_html: []const u8,
+) []const u8 {
     return b.fmt(
         \\<!doctype html>
         \\<html>
@@ -659,6 +672,7 @@ fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const 
         \\    <meta charset="utf-8" />
         \\    <base href="{s}" />
         \\    <title>{s}</title>
+        \\    <meta name="description" content="{s}" />
         \\  </head>
         \\  <body>
         \\    <script type="module">
@@ -694,7 +708,7 @@ fn buildIndexHtml(b: *std.Build, wasm_name: []const u8, runtime_import: []const 
         \\    </script>
         \\  </body>
         \\</html>
-    , .{ base_path, wasm_name, runtime_import, wasm_name });
+    , .{ base_path, name_html, summary_html, runtime_import, wasm_name });
 }
 
 fn execName(b: *std.Build, id: []const u8, exec_name: ?[]const u8) []const u8 {

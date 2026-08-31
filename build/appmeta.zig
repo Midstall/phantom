@@ -148,8 +148,11 @@ pub fn importPathFor(s: Strategy) []const u8 {
     };
 }
 
-/// Escape a value for XML content or a double-quoted attribute.
-fn xmlEscape(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+/// Escape a value for XML content or a double-quoted attribute. HTML uses the
+/// same escape set for text content and double-quoted attributes, so the
+/// generated web page's title and description reuse this rather than a
+/// second copy of the same five substitutions.
+pub fn xmlEscape(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     for (s) |ch| switch (ch) {
