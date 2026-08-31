@@ -287,6 +287,12 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             ops.appendChild(parent, svg);
         },
         .text => |run| {
+            // A zero length run has nothing to draw, and it is not safe to give
+            // one to the host. An empty slice carries the allocator's dangling
+            // pointer, and the JS side builds a memory view from that pointer
+            // before it reads the length, so it throws on a view it never
+            // needed. A blank line in a code block produces exactly this run.
+            if (run.text.len == 0) continue;
             const ox: f32 = if (region_origin) |o| o.x else 0;
             const oy: f32 = if (region_origin) |o| o.y else 0;
             const font_ptr: *text.Font = @ptrCast(@alignCast(run.font));

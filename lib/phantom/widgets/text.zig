@@ -70,6 +70,13 @@ const RenderText = struct {
         // the full paragraph on every line and overflow the box it is in.
         var y = offset.y;
         for (p.lines) |l| {
+            // A blank line still holds its height, which the layout above
+            // already counted, but it draws nothing. Emitting a run for it
+            // gives every backend an empty slice to carry for no reason.
+            if (l.start == l.end) {
+                y += l.height;
+                continue;
+            }
             cv.drawText(.{
                 .glyphs = l.glyphs,
                 .text = self.text[l.start..l.end],
@@ -454,4 +461,22 @@ test "a wrapping Text stacks its lines down the box rather than drawing them on 
     const ro: *RenderText = @fieldParentPtr("base", h.root.render_object.?);
     try std.testing.expectEqual(ro.para.?.lines.len, ys.items.len);
     for (ys.items[1..], 0..) |y, i| try std.testing.expect(y > ys.items[i]);
+}
+
+test "an empty Text emits no run at all, so no backend receives a zero length slice" {
+    const gpa = std.testing.allocator;
+    var h = try phantom.testing.mount(gpa, blk: {
+        const t = Text{ .text = "", .size = 16 };
+        break :blk t.widget();
+    });
+    defer h.deinit();
+    try h.pump();
+
+    // An empty slice carries the allocator's dangling pointer. The web host
+    // builds a memory view from that pointer before it reads the length, so a
+    // run holding one crashes the whole render. A blank line in a code block
+    // reaches here, which is how this was found.
+    for (h.canvas.list.primitives.items) |prim| {
+        try std.testing.expect(prim != .text);
+    }
 }
