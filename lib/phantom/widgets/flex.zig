@@ -9,6 +9,7 @@ const geom = phantom.geometry;
 const layout = phantom.layout;
 const RenderObject = phantom.RenderObject;
 const Canvas = phantom.Canvas;
+const testing = @import("../testing.zig");
 
 pub const Axis = enum { vertical, horizontal };
 pub const MainAxisAlignment = enum {
@@ -179,24 +180,31 @@ pub const RenderFlex = struct {
             .vertical => std.math.isInf(c.max_height),
             .horizontal => std.math.isInf(c.max_width),
         };
-        // Cross-axis extent: use bounded value from biggest() as usual.
-        const cross_ext_for_children = crossExtent(self.direction, size);
-        const child_c: layout.BoxConstraints = if (main_unbounded) switch (self.direction) {
+        // An unbounded cross axis gets the same treatment as an unbounded main axis:
+        // a child sees infinity and reports its natural extent, instead of the zero
+        // that biggest() would give an unbounded axis.
+        const cross_unbounded = switch (self.direction) {
+            .vertical => std.math.isInf(c.max_width),
+            .horizontal => std.math.isInf(c.max_height),
+        };
+        const cross_ext_for_children = if (cross_unbounded) std.math.inf(f32) else crossExtent(self.direction, size);
+        const main_ext_for_children = if (main_unbounded) std.math.inf(f32) else mainExtent(self.direction, size);
+        const child_c: layout.BoxConstraints = switch (self.direction) {
             .vertical => .{
                 .min_width = 0,
                 .max_width = cross_ext_for_children,
                 .min_height = 0,
-                .max_height = std.math.inf(f32),
+                .max_height = main_ext_for_children,
                 .scale = c.scale,
             },
             .horizontal => .{
                 .min_width = 0,
-                .max_width = std.math.inf(f32),
+                .max_width = main_ext_for_children,
                 .min_height = 0,
                 .max_height = cross_ext_for_children,
                 .scale = c.scale,
             },
-        } else layout.BoxConstraints{ .max_width = size.width, .max_height = size.height, .scale = c.scale };
+        };
         self.offsets.clearRetainingCapacity();
         self.offsets.ensureTotalCapacity(self.gpa, self.children.items.len) catch {
             self.reportOom("out of memory reserving Flex child offsets");
@@ -239,7 +247,10 @@ pub const RenderFlex = struct {
             }
         }
 
-        const cross_ext = if (main_unbounded) total_cross else crossExtent(self.direction, size);
+        // total_cross is the tallest (or widest) child seen above. Standard flex
+        // behaviour sizes the cross axis to that child whenever the parent did not
+        // hand this flex a bound to fill.
+        const cross_ext = if (main_unbounded or cross_unbounded) total_cross else crossExtent(self.direction, size);
         const spacing = spacingFor(self.main, main_ext - total_main, self.children.items.len);
         var main_pos: f32 = spacing.leading;
         for (self.children.items) |ch| {
@@ -257,10 +268,16 @@ pub const RenderFlex = struct {
             };
             main_pos += cm + spacing.between;
         }
-        return if (main_unbounded) switch (self.direction) {
-            .vertical => .{ .width = size.width, .height = total_main },
-            .horizontal => .{ .width = total_main, .height = size.height },
-        } else size;
+        return switch (self.direction) {
+            .vertical => .{
+                .width = cross_ext,
+                .height = if (main_unbounded) total_main else size.height,
+            },
+            .horizontal => .{
+                .width = if (main_unbounded) total_main else size.width,
+                .height = cross_ext,
+            },
+        };
     }
 
     pub fn paintFn(base: *RenderObject, cv: *Canvas, offset: geom.PhysicalOffset) anyerror!void {
@@ -1087,4 +1104,90 @@ test "a Flexible render object is tagged so only a real one is read as flexible"
     // An untagged render object must never be downcast to RenderFlexible.
     try std.testing.expect(asFlexible(plain_el.renderObject().?) == null);
     try std.testing.expectEqual(@as(u16, 0), flexOf(plain_el.renderObject().?));
+}
+
+test "a Row given a bounded width and an infinite max height reports its tallest child's height" {
+    // The main axis (width) is bounded as usual; the cross axis (height) is the
+    // one an unbounded parent, such as a vertical ScrollView, hands a Row. The
+    // old code read the cross extent off biggest(), which is zero on an
+    // unbounded axis, so the row reported zero height no matter what it held.
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(20, 30);
+    var b = FixedBox.make(20, 50);
+    var rf = makeFlex(gpa, .horizontal, .start);
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+    const size = rf.base.layout(.{ .min_width = 0, .max_width = 200, .min_height = 0, .max_height = std.math.inf(f32) });
+    try std.testing.expectEqual(@as(f32, 50), size.height);
+}
+
+test "a Column given a bounded height and an infinite max width reports its widest child's width" {
+    // Same fault, the other axis: a Column's cross axis is width, and an
+    // unbounded parent (a horizontal ScrollView) hands it infinity there.
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(20, 30);
+    var b = FixedBox.make(50, 30);
+    var rf = makeFlex(gpa, .vertical, .start);
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+    const size = rf.base.layout(.{ .min_width = 0, .max_width = std.math.inf(f32), .min_height = 0, .max_height = 200 });
+    try std.testing.expectEqual(@as(f32, 50), size.width);
+}
+
+// Depth-first search for the first render object with an on_up handler, the
+// way a real hit test would find a tap target. A plain pointer != null match
+// would also catch the ScrollView itself, which installs a scroll handler
+// but no tap handler.
+fn findTappable(el: *Element) ?*RenderObject {
+    if (el.renderObject()) |ro| {
+        if (ro.pointer) |p| if (p.on_up != null) return ro;
+    }
+    if (el.child) |c| {
+        if (findTappable(c)) |ro| return ro;
+    }
+    for (el.children.items) |c| {
+        if (findTappable(c)) |ro| return ro;
+    }
+    return null;
+}
+
+test "a Row inside a ScrollView gives its child nonzero height, and a tap there reaches it" {
+    // Pins the user-visible symptom: the showcase's home page held link cards
+    // in a Row inside a vertical ScrollView. A zero-height row cannot be
+    // tapped, so the cards were invisible and dead to the pointer.
+    const gpa = std.testing.allocator;
+    var taps: u32 = 0;
+    var fill = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    var sized = phantom.SizedBox{ .width = 50, .height = 40, .child = fill.widget() };
+    var tappable = phantom.GestureDetector{ .ctx = &taps, .on_tap = struct {
+        fn f(ctx: *anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(ctx));
+            c.* += 1;
+        }
+    }.f, .child = sized.widget() };
+    const kids = [_]Widget{tappable.widget()};
+    var row = Row(.{ .children = &kids });
+    var sv = phantom.ScrollView{ .child = row.widget() };
+
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 200, .height = 300 };
+    try h.pump();
+
+    const target = findTappable(h.root) orelse return error.NoPointerRenderObject;
+    try std.testing.expectEqual(@as(f32, 40), target.size.height);
+
+    h.tapAt(.{
+        .x = target.origin.x + target.size.width / 2.0,
+        .y = target.origin.y + target.size.height / 2.0,
+    });
+    try std.testing.expectEqual(@as(u32, 1), taps);
 }
