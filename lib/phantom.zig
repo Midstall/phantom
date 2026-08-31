@@ -184,6 +184,7 @@ pub const RouterHandle = router.RouterHandle;
 pub const platform = @import("phantom/platform.zig");
 pub const Platform = platform.Platform;
 pub const UrlStrategy = platform.UrlStrategy;
+pub const WriteMode = platform.WriteMode;
 pub const link_widget = @import("phantom/widgets/link.zig");
 pub const Link = link_widget.Link;
 

@@ -23,6 +23,10 @@ pub const FaultCode = enum {
     route_rejected,
     /// A link was tapped on a backend that cannot open a URL.
     link_unsupported,
+    /// The browser's address was longer than the buffer that reads it. The
+    /// read is refused rather than truncated, because a truncated address is
+    /// a different, shorter route than the one the user is actually on.
+    location_too_long,
 };
 
 pub const Fault = struct {

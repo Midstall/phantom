@@ -183,8 +183,10 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\
         \\// Reads the address bar into buf, according to the build's url strategy. A
         \\// hash strategy trims the leading '#' and reads an empty hash as "/", so a
-        \\// fresh page with no hash still resolves to the root route.
-        \\fn currentPath(win: dom.Window, buf: []u8) []const u8 {{
+        \\// fresh page with no hash still resolves to the root route. Null when the
+        \\// address does not fit buf: the caller must refuse it rather than take a
+        \\// truncated, shorter route than the one the browser actually shows.
+        \\fn currentPath(win: dom.Window, buf: []u8) ?[]const u8 {{
         \\    const loc = win.get_location();
         \\    const raw = if (strategy_is_hash) loc.get_hash() else loc.get_pathname();
         \\    defer webidl.rt.freeStr(raw);
@@ -193,9 +195,9 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\        if (s.len > 0 and s[0] == '#') s = s[1..];
         \\        if (s.len == 0) s = "/";
         \\    }}
-        \\    const n = @min(s.len, buf.len);
-        \\    @memcpy(buf[0..n], s[0..n]);
-        \\    return buf[0..n];
+        \\    if (s.len > buf.len) return null;
+        \\    @memcpy(buf[0..s.len], s);
+        \\    return buf[0..s.len];
         \\}}
         \\
         \\fn openUrl(ctx: *anyopaque, url: []const u8) void {{
@@ -204,31 +206,35 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\    win.open(url, "_blank");
         \\}}
         \\
-        \\fn readLocation(ctx: *anyopaque, buf: []u8) []const u8 {{
+        \\fn readLocation(ctx: *anyopaque, buf: []u8) ?[]const u8 {{
         \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
         \\    const win = dom.Window{{ .handle = c.window }};
         \\    return currentPath(win, buf);
         \\}}
         \\
-        \\// Puts path in the address bar. Skipped when the bar already shows it: a
-        \\// browser-driven back or forward already moved the address bar before this
-        \\// runs (through locationChanged below), and writing again would push a
-        \\// duplicate history entry that turns one back-button press into two.
-        \\fn writeLocation(ctx: *anyopaque, path: []const u8) void {{
+        \\// Puts path in the address bar, in the given mode: push adds a history
+        \\// entry, replace rewrites the current one. The guard that once skipped a
+        \\// redundant write here now lives in phantom.web, in the thunk that calls
+        \\// this function: it compares against the same read_location this file
+        \\// exposes, so it can be tested with no browser.
+        \\fn writeLocation(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {{
         \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
         \\    const win = dom.Window{{ .handle = c.window }};
-        \\    var cur_buf: [phantom.router.max_path]u8 = undefined;
-        \\    const cur = currentPath(win, &cur_buf);
-        \\    if (std.mem.eql(u8, cur, path)) return;
         \\    const hist = win.get_history();
         \\    if (strategy_is_hash) {{
         \\        var url_buf: [phantom.router.max_path + 1]u8 = undefined;
         \\        const n = @min(path.len, url_buf.len - 1);
         \\        url_buf[0] = '#';
         \\        @memcpy(url_buf[1 .. 1 + n], path[0..n]);
-        \\        hist.pushState("", "", url_buf[0 .. 1 + n]);
+        \\        switch (mode) {{
+        \\            .push => hist.pushState("", "", url_buf[0 .. 1 + n]),
+        \\            .replace => hist.replaceState("", "", url_buf[0 .. 1 + n]),
+        \\        }}
         \\    }} else {{
-        \\        hist.pushState("", "", path);
+        \\        switch (mode) {{
+        \\            .push => hist.pushState("", "", path),
+        \\            .replace => hist.replaceState("", "", path),
+        \\        }}
         \\    }}
         \\}}
         \\
@@ -286,9 +292,7 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         \\export fn locationChanged(app: usize) void {{
         \\    if (app == 0) return;
         \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    var buf: [phantom.router.max_path]u8 = undefined;
-        \\    const path = a.owner.platform.readLocation(&buf) orelse return;
-        \\    a.navigate(path);
+        \\    a.locationChanged();
         \\}}
     , .{if (opts.url_strategy == .hash) "true" else "false"});
     const entry = b.addWriteFiles().add("main.zig", entry_src);

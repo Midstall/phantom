@@ -209,13 +209,16 @@ pub const Router = struct {
                 s.base.element.owner.sink.report(.route_rejected, @errorName(e));
                 return;
             };
-            s.sync();
+            s.sync(.push);
             phantom.markNeedsBuild(s);
         }
 
         pub fn pop(s: *State) bool {
             if (!s.stack.pop()) return false;
-            s.sync();
+            // Rewrites the browser's current entry rather than removing one:
+            // the framework has no way to pop an entry out of the browser's
+            // own history, only to push a new one or overwrite the top.
+            s.sync(.replace);
             phantom.markNeedsBuild(s);
             return true;
         }
@@ -225,15 +228,15 @@ pub const Router = struct {
                 s.base.element.owner.sink.report(.route_rejected, @errorName(e));
                 return;
             };
-            s.sync();
+            s.sync(.replace);
             phantom.markNeedsBuild(s);
         }
 
         /// Publishes the top of the stack to the address bar. A backend with
         /// no location hook leaves the history in memory, which is what the
         /// terminal and the window backends want.
-        fn sync(s: *State) void {
-            s.base.element.owner.platform.writeLocation(s.stack.current());
+        fn sync(s: *State, mode: phantom.WriteMode) void {
+            s.base.element.owner.platform.writeLocation(s.stack.current(), mode);
         }
 
         pub fn build(s: *State, b: *BuildContext) anyerror!Widget {
@@ -442,6 +445,51 @@ test "a path longer than the buffer is refused and the location does not change"
     try h.pump();
     try std.testing.expectEqualStrings("/", state.location());
     try h.expectFault(.route_rejected);
+}
+
+// ---------------------------------------------------------------------------
+// WriteMode tests
+// ---------------------------------------------------------------------------
+
+const WriteModeSpy = struct {
+    last_mode: ?phantom.WriteMode = null,
+    calls: usize = 0,
+
+    fn write(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {
+        _ = path;
+        const self: *WriteModeSpy = @ptrCast(@alignCast(ctx));
+        self.last_mode = mode;
+        self.calls += 1;
+    }
+};
+
+test "push writes the browser location in push mode and replace writes it in replace mode" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    var spy = WriteModeSpy{};
+    h.owner.platform = .{ .ctx = &spy, .write_location = WriteModeSpy.write };
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+
+    state.push("/gallery");
+    try std.testing.expectEqual(phantom.WriteMode.push, spy.last_mode.?);
+
+    state.replace("/about");
+    try std.testing.expectEqual(phantom.WriteMode.replace, spy.last_mode.?);
+}
+
+test "pop writes the browser location in replace mode, because the framework cannot pop a browser history entry" {
+    const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
+    var h = try phantom.testing.mount(std.testing.allocator, r.widget());
+    defer h.deinit();
+    var spy = WriteModeSpy{};
+    h.owner.platform = .{ .ctx = &spy, .write_location = WriteModeSpy.write };
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    state.push("/gallery");
+
+    try std.testing.expect(state.pop());
+
+    try std.testing.expectEqual(phantom.WriteMode.replace, spy.last_mode.?);
 }
 
 fn atlasPage(b: *BuildContext) Widget {

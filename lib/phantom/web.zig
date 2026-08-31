@@ -88,6 +88,20 @@ pub const WebApp = struct {
         h.replace(path);
         self.render();
     }
+
+    /// The browser moved back or forward, or a host tells the tree the
+    /// address changed some other way. Reads the new path through the same
+    /// hook the tree already writes with, then tells the router.
+    ///
+    /// Does nothing when the address cannot be read: with no read hook, or
+    /// when `platform.readLocation` refuses an over-long address. The refusal
+    /// itself already reports the fault, at the point where the true length
+    /// is still known, so this is not a second silent failure.
+    pub fn locationChanged(self: *WebApp) void {
+        var buf: [phantom.router.max_path]u8 = undefined;
+        const path = self.owner.platform.readLocation(&buf) orelse return;
+        self.navigate(path);
+    }
 };
 
 fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
@@ -96,16 +110,32 @@ fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
     f(app.ops.ctx, url);
 }
 
-fn readLocationThunk(ctx: *anyopaque, buf: []u8) []const u8 {
+fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
     const f = app.ops.read_location orelse return buf[0..0];
-    return f(app.ops.ctx, buf);
+    return f(app.ops.ctx, buf) orelse {
+        // The real address does not fit `buf`. Taking the first max_path
+        // bytes would land the tree on a different, shorter route than the
+        // one the user is actually on, so the read is refused instead.
+        app.sink.report(.location_too_long, "the browser address is longer than the buffer that reads it");
+        return null;
+    };
 }
 
-fn writeLocationThunk(ctx: *anyopaque, path: []const u8) void {
+fn writeLocationThunk(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
     const f = app.ops.write_location orelse return;
-    f(app.ops.ctx, path);
+    // Skip the browser call when the address bar already shows this path. A
+    // browser-driven back or forward already moved it before this runs
+    // (through `locationChanged`), and writing again would add a duplicate
+    // history entry, turning one back-button press into two.
+    if (app.ops.read_location) |read| {
+        var buf: [phantom.router.max_path]u8 = undefined;
+        if (read(app.ops.ctx, &buf)) |cur| {
+            if (std.mem.eql(u8, cur, path)) return;
+        }
+    }
+    f(app.ops.ctx, path, mode);
 }
 
 fn webNow(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
@@ -324,6 +354,75 @@ test "the web std.Io is identical to std.Io.failing in every entry except now" {
     try std.testing.expect(io.vtable.now != std.Io.failing.vtable.now);
     // A vtable that shrank to nothing would satisfy the loop above vacuously.
     try std.testing.expectEqual(@typeInfo(std.Io.VTable).@"struct".fields.len - 1, checked);
+}
+
+// ---------------------------------------------------------------------------
+// write_location guard and read_location refusal (no browser: DomOps comes
+// from dom_calls.Recorder)
+// ---------------------------------------------------------------------------
+
+fn countOccurrences(log: []const []u8, needle: []const u8) usize {
+    var n: usize = 0;
+    for (log) |l| {
+        if (std.mem.indexOf(u8, l, needle) != null) n += 1;
+    }
+    return n;
+}
+
+test "writing the same location twice reaches the browser once, and a different one reaches it again" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var app = clockOnlyApp(0, 0);
+    app.ops = rec.ops();
+    app.sink = &sink;
+    app.owner = &owner;
+    owner.platform = .{ .ctx = &app, .read_location = readLocationThunk, .write_location = writeLocationThunk };
+
+    owner.platform.writeLocation("/gallery", .push);
+    owner.platform.writeLocation("/gallery", .push);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(rec.log.items, "writeLocation("));
+
+    owner.platform.writeLocation("/about", .push);
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(rec.log.items, "writeLocation("));
+}
+
+fn locFaultHome(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Text{ .text = "home" }).widget();
+}
+
+const loc_fault_routes = [_]phantom.Route{
+    .{ .path = "/", .build = locFaultHome },
+};
+
+test "an over long browser address is refused: it reports the fault and the router's location does not change" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    // Longer than the router's own buffer, parked as if the page had been
+    // opened on an address nobody typed by hand.
+    const long = "/" ++ ("a" ** phantom.router.max_path);
+    rec.setLocation(long);
+
+    const r = phantom.Router{ .routes = &loc_fault_routes, .initial = "/", .not_found = locFaultHome };
+    var h = try phantom.testing.mount(gpa, r.widget());
+    defer h.deinit();
+    const state = try h.stateOf(phantom.testing.find.byType(phantom.Router), phantom.Router.State);
+    try std.testing.expectEqualStrings("/", state.location());
+
+    var app = clockOnlyApp(0, 0);
+    app.ops = rec.ops();
+    app.sink = h.sink;
+    app.owner = h.owner;
+    h.owner.platform = .{ .ctx = &app, .read_location = readLocationThunk, .write_location = writeLocationThunk };
+
+    app.locationChanged();
+
+    try std.testing.expectEqualStrings("/", state.location());
+    try h.expectFault(.location_too_long);
 }
 
 test "a browser tick advances the wall clock and the monotonic clock separately" {

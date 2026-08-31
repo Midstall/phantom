@@ -6,6 +6,7 @@ const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
 const icon_builtin = @import("../icon/builtin.zig");
 const svg_path = @import("../icon/svg_path.zig");
+const platform = @import("../platform.zig");
 
 /// The namespace an `<svg>` and its children must be created in. `createElement`
 /// puts an element in the HTML namespace whatever its name is, and an `svg` in
@@ -33,10 +34,13 @@ pub const DomOps = struct {
     head: u32,
     /// Opens a URL in a new tab. Null on a host that has no browser.
     open_url: ?*const fn (ctx: *anyopaque, url: []const u8) void = null,
-    /// Writes the current route into `buf` and returns the written part.
-    read_location: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
-    /// Puts `path` in the address bar without loading a new page.
-    write_location: ?*const fn (ctx: *anyopaque, path: []const u8) void = null,
+    /// Writes the current route into `buf` and returns the written part, or
+    /// null when the real route is longer than `buf` can hold. A truncated
+    /// route is a different, shorter one than the browser actually shows, so
+    /// the caller must refuse it rather than take the shortened copy.
+    read_location: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Puts `path` in the address bar without loading a new page, in `mode`.
+    write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -325,17 +329,50 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
 }
 
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
-const Recorder = struct {
+// Exported so a test outside this file (a WebApp test with no browser) can
+// drive one through `phantom.backend.dom_calls.Recorder`.
+pub const Recorder = struct {
     gpa: std.mem.Allocator,
     log: std.ArrayList([]u8) = .empty,
     next_handle: u32 = 100,
+    /// Mimics the address bar for `read_location` / `write_location`. Empty
+    /// until a write happens, the same as a fresh page with nothing written
+    /// to its history yet.
+    location_buf: [location_cap]u8 = undefined,
+    location_len: usize = 0,
+
+    /// Comfortably past `router.max_path`, so a test can park a location here
+    /// that is too long for the router's own buffer without touching this
+    /// buffer's limit.
+    pub const location_cap = 512;
+
+    /// Sets the location `read_location` reports, without recording a call.
+    /// Lets a test start a Recorder already parked at a given address, the
+    /// same as a page freshly opened on a link somebody sent.
+    pub fn setLocation(self: *Recorder, path: []const u8) void {
+        @memcpy(self.location_buf[0..path.len], path);
+        self.location_len = path.len;
+    }
+
+    fn readLocation(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        if (self.location_len > buf.len) return null;
+        @memcpy(buf[0..self.location_len], self.location_buf[0..self.location_len]);
+        return buf[0..self.location_len];
+    }
+
+    fn writeLocation(ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("writeLocation({s},{s})", .{ path, @tagName(mode) });
+        self.setLocation(path);
+    }
 
     fn rec(self: *Recorder, comptime fmt: []const u8, args: anytype) void {
         const line = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
         self.log.append(self.gpa, line) catch {};
     }
 
-    fn deinit(self: *Recorder) void {
+    pub fn deinit(self: *Recorder) void {
         for (self.log.items) |l| self.gpa.free(l);
         self.log.deinit(self.gpa);
     }
@@ -381,7 +418,7 @@ const Recorder = struct {
         self.rec("clearChildren({d})", .{node});
     }
 
-    fn ops(self: *Recorder) DomOps {
+    pub fn ops(self: *Recorder) DomOps {
         return .{
             .ctx = self,
             .create_element = createElement,
@@ -393,6 +430,8 @@ const Recorder = struct {
             .clear_children = clearChildren,
             .body = 1,
             .head = 2,
+            .read_location = readLocation,
+            .write_location = writeLocation,
         };
     }
 };
