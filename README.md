@@ -62,6 +62,27 @@ None of these are small bugs; each is a missing piece of the Windows
 console model and real work to add. This is a known state, not an oversight,
 and the project owner decides when Windows gets them.
 
+## The web backend and Content Security Policy
+
+A Phantom page needs a Content Security Policy that permits three things. None of
+them are optional today, and a policy that omits them gives a blank page with a
+console violation rather than an error anyone can act on, so they are written
+here rather than discovered.
+
+| Directive | Needs | Why |
+|---|---|---|
+| `script-src` | `'self'` and `'wasm-unsafe-eval'` | The page is a shell that loads `boot.js` as a file, so `'self'` is enough and no nonce or `'unsafe-inline'` is wanted. `'wasm-unsafe-eval'` is what allows the module to be compiled at all. |
+| `style-src` | `'unsafe-inline'` | Every node is positioned with a `style` attribute. A browser reports these against `style-src-attr` and suggests `'unsafe-hashes'`, so that is what the console will name; `style-src 'unsafe-inline'` covers it. A style ATTRIBUTE cannot carry a nonce, so there is no strict form of this today. |
+| `font-src`, `img-src` | `data:` | A font is embedded as `@font-face { src: url(data:font/otf;base64,...) }` and an `Image` emits a `data:image/png` URL. |
+
+`connect-src 'self'` is enough for an application talking to its own server,
+because a request for the page's own host is handed to the browser as a bare
+path. See `lib/phantom/web_net.zig` for the one rule that makes that true.
+
+The `style-src` line is the one worth arguing about, and it is a real cost rather
+than an oversight: it is the direct consequence of the DOM backend positioning
+every node itself instead of emitting a stylesheet.
+
 ## Choosing a backend
 
 `phantom.App.run` picks a backend at startup:

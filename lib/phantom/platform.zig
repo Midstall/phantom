@@ -1,7 +1,7 @@
 //! The hooks a backend fills in for the things a widget tree cannot do by
-//! itself: open a URL, and read or write the address of the page. Native
-//! backends leave them null, and a widget that finds a null hook does nothing
-//! rather than guessing.
+//! itself: open a URL, and read or write the address of the page, its query
+//! string included. Native backends leave them null, and a widget that finds a
+//! null hook does nothing rather than guessing.
 
 const std = @import("std");
 
@@ -31,6 +31,22 @@ pub const Platform = struct {
     /// allocates the string and must free it again.
     read_location: ?*const fn (*anyopaque, []u8) ?[]const u8 = null,
     write_location: ?*const fn (*anyopaque, []const u8, WriteMode) void = null,
+    /// Writes the query string into `buf`, without its leading "?", and returns
+    /// the written part. Null when the query is longer than `buf` can hold, on
+    /// the same rule `read_location` follows: half a query answers a different
+    /// question than the whole one.
+    ///
+    /// Separate from `read_location` because the two are separate parts of the
+    /// address and an application reads them for different reasons. The route
+    /// decides what is built; the query carries what a redirect handed back.
+    read_query: ?*const fn (*anyopaque, []u8) ?[]const u8 = null,
+    /// Writes the host the page is served from, with no port and no scheme on it,
+    /// and returns the written part. Null when it does not fit.
+    ///
+    /// An application needs this to talk to its own server: it has to name a host
+    /// in the URL it asks for, and only the page knows what that is. A hard coded
+    /// one works on the machine it was written on and nowhere else.
+    read_host: ?*const fn (*anyopaque, []u8) ?[]const u8 = null,
     strategy: UrlStrategy = .hash,
 
     /// True if a hook took the URL. False means nothing happened, which is the
@@ -44,6 +60,28 @@ pub const Platform = struct {
 
     pub fn readLocation(self: Platform, buf: []u8) ?[]const u8 {
         const f = self.read_location orelse return null;
+        const c = self.ctx orelse return null;
+        return f(c, buf);
+    }
+
+    /// The query string with no leading "?".
+    ///
+    /// An empty slice and null are different answers. Empty means the address
+    /// carries no query, which is the ordinary case. Null means the query could
+    /// not be read: no hook on this backend, or a query too long for `buf`.
+    pub fn readQuery(self: Platform, buf: []u8) ?[]const u8 {
+        const f = self.read_query orelse return null;
+        const c = self.ctx orelse return null;
+        return f(c, buf);
+    }
+
+    /// The host the page is served from, with no port on it.
+    ///
+    /// Null on a backend that is not a page, which is every native one. An
+    /// application that finds null is not running in a browser and has no origin
+    /// of its own to talk to.
+    pub fn readHost(self: Platform, buf: []u8) ?[]const u8 {
+        const f = self.read_host orelse return null;
         const c = self.ctx orelse return null;
         return f(c, buf);
     }
@@ -99,4 +137,22 @@ test "writeLocation passes the mode to the hook unchanged" {
 
     p.writeLocation("/gallery", .replace);
     try std.testing.expectEqual(WriteMode.replace, spy.seen_mode.?);
+}
+
+test "readQuery with no hook returns null, which is not the same answer as an empty query" {
+    // A backend with no query to read and a page whose address carries no query
+    // must not look alike: one of them can never answer, the other answered
+    // "there is none".
+    const p = Platform{};
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), p.readQuery(&buf));
+
+    const Spy = struct {
+        fn read(_: *anyopaque, b: []u8) ?[]const u8 {
+            return b[0..0];
+        }
+    };
+    var ctx: u8 = 0;
+    const q = Platform{ .ctx = &ctx, .read_query = Spy.read };
+    try std.testing.expectEqualStrings("", q.readQuery(&buf).?);
 }

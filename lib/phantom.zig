@@ -161,6 +161,7 @@ pub const Tui = tui.Tui;
 pub const testing = @import("phantom/testing.zig");
 
 pub const web = @import("phantom/web.zig");
+pub const web_net = @import("phantom/web_net.zig");
 
 pub const text = @import("phantom/text.zig");
 
@@ -283,4 +284,5 @@ test {
     _ = @import("phantom/router.zig");
     _ = @import("phantom/platform.zig");
     _ = @import("phantom/widgets/link.zig");
+    _ = @import("phantom/web_net.zig");
 }

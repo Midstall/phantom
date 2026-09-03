@@ -137,201 +137,22 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     });
     app_mod.addImport("phantom", phantom_wasm);
 
-    // Generated web entry: implements DomOps via the generated dom module and passes
-    // them to phantom.web.init. Returns the *WebApp as a usize so JS holds the pointer.
-    // dom_ctx is module-level in the app-glue entry (single wasm instance, acceptable here).
-    const entry_src = b.fmt(
-        \\const std = @import("std");
-        \\const phantom = @import("phantom");
-        \\const dom = @import("dom");
-        \\const webidl = @import("webidl");
-        \\const app_root = @import("app_root");
-        \\
-        \\const strategy_is_hash = {s};
-        \\
-        \\const DomCtx = struct {{ doc: u32, window: u32 }};
-        \\var dom_ctx: DomCtx = undefined;
-        \\
-        \\fn createElement(ctx: *anyopaque, tag: []const u8) u32 {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{{ .handle = c.doc }};
-        \\    return doc.createElement(tag).handle;
-        \\}}
-        \\// An `svg` made by createElement lands in the HTML namespace, where a
-        \\// browser lays it out and never paints it. Only the namespaced call
-        \\// reaches the SVG namespace, so icons need this one.
-        \\fn createElementNS(ctx: *anyopaque, ns: []const u8, tag: []const u8) u32 {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{{ .handle = c.doc }};
-        \\    return doc.createElementNS(ns, tag).handle;
-        \\}}
-        \\fn createTextNode(ctx: *anyopaque, data: []const u8) u32 {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const doc = dom.Document{{ .handle = c.doc }};
-        \\    return doc.createTextNode(data).handle;
-        \\}}
-        \\fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = node }};
-        \\    el.setAttribute(name, value);
-        \\}}
-        \\fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = node }};
-        \\    el.set_textContent(textv);
-        \\}}
-        \\fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = parent }};
-        \\    _ = el.appendChild(dom.Node{{ .handle = child }});
-        \\}}
-        \\fn clearChildren(ctx: *anyopaque, node: u32) void {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = node }};
-        \\    el.set_innerHTML("");
-        \\}}
-        \\// A tap rebuilds the whole DOM (see phantom.backend.dom_calls.render), so
-        \\// the browser-owned scroll position of an open region would reset to the
-        \\// top on every tap unless it is read back before the old div is thrown
-        \\// away and written onto the new one. These two hooks are that read/write.
-        \\fn readScrollOffset(ctx: *anyopaque, node: u32) phantom.PhysicalOffset {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = node }};
-        \\    return .{{ .x = @floatCast(el.get_scrollLeft()), .y = @floatCast(el.get_scrollTop()) }};
-        \\}}
-        \\fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: phantom.PhysicalOffset) void {{
-        \\    _ = ctx;
-        \\    const el = dom.Element{{ .handle = node }};
-        \\    el.set_scrollLeft(@floatCast(offset.x));
-        \\    el.set_scrollTop(@floatCast(offset.y));
-        \\}}
-        \\
-        \\// Reads the address bar into buf, according to the build's url strategy. A
-        \\// hash strategy trims the leading '#' and reads an empty hash as "/", so a
-        \\// fresh page with no hash still resolves to the root route. Null when the
-        \\// address does not fit buf: the caller must refuse it rather than take a
-        \\// truncated, shorter route than the one the browser actually shows.
-        \\fn currentPath(win: dom.Window, buf: []u8) ?[]const u8 {{
-        \\    const loc = win.get_location();
-        \\    const raw = if (strategy_is_hash) loc.get_hash() else loc.get_pathname();
-        \\    defer webidl.rt.freeStr(raw);
-        \\    var s = raw;
-        \\    if (strategy_is_hash) {{
-        \\        if (s.len > 0 and s[0] == '#') s = s[1..];
-        \\        if (s.len == 0) s = "/";
-        \\    }}
-        \\    if (s.len > buf.len) return null;
-        \\    @memcpy(buf[0..s.len], s);
-        \\    return buf[0..s.len];
-        \\}}
-        \\
-        \\fn openUrl(ctx: *anyopaque, url: []const u8) void {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const win = dom.Window{{ .handle = c.window }};
-        \\    win.open(url, "_blank");
-        \\}}
-        \\
-        \\fn readLocation(ctx: *anyopaque, buf: []u8) ?[]const u8 {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const win = dom.Window{{ .handle = c.window }};
-        \\    return currentPath(win, buf);
-        \\}}
-        \\
-        \\// Puts path in the address bar, in the given mode: push adds a history
-        \\// entry, replace rewrites the current one. The guard that once skipped a
-        \\// redundant write here now lives in phantom.web, in the thunk that calls
-        \\// this function: it compares against the same read_location this file
-        \\// exposes, so it can be tested with no browser.
-        \\fn writeLocation(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {{
-        \\    const c: *DomCtx = @ptrCast(@alignCast(ctx));
-        \\    const win = dom.Window{{ .handle = c.window }};
-        \\    const hist = win.get_history();
-        \\    if (strategy_is_hash) {{
-        \\        var url_buf: [phantom.router.max_path + 1]u8 = undefined;
-        \\        const n = @min(path.len, url_buf.len - 1);
-        \\        url_buf[0] = '#';
-        \\        @memcpy(url_buf[1 .. 1 + n], path[0..n]);
-        \\        switch (mode) {{
-        \\            .push => hist.pushState("", "", url_buf[0 .. 1 + n]),
-        \\            .replace => hist.replaceState("", "", url_buf[0 .. 1 + n]),
-        \\        }}
-        \\    }} else {{
-        \\        switch (mode) {{
-        \\            .push => hist.pushState("", "", path),
-        \\            .replace => hist.replaceState("", "", path),
-        \\        }}
-        \\    }}
-        \\}}
-        \\
-        \\export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {{
-        \\    const win = dom.Window{{ .handle = window_handle }};
-        \\    const vw: u32 = win.get_innerWidth();
-        \\    const vh: u32 = win.get_innerHeight();
-        \\    const dpr: f64 = win.get_devicePixelRatio();
-        \\    dom_ctx = .{{ .doc = doc_handle, .window = window_handle }};
-        \\    const _doc = dom.Document{{ .handle = doc_handle }};
-        \\    const head = _doc.get_head().handle;
-        \\    const ops = phantom.backend.dom_calls.DomOps{{
-        \\        .ctx = &dom_ctx,
-        \\        .create_element = createElement,
-        \\        .create_element_ns = createElementNS,
-        \\        .create_text_node = createTextNode,
-        \\        .set_attribute = setAttribute,
-        \\        .set_text_content = setTextContent,
-        \\        .append_child = appendChild,
-        \\        .clear_children = clearChildren,
-        \\        .body = body_handle,
-        \\        .head = head,
-        \\        .open_url = openUrl,
-        \\        .read_location = readLocation,
-        \\        .write_location = writeLocation,
-        \\        .read_scroll_offset = readScrollOffset,
-        \\        .write_scroll_offset = writeScrollOffset,
-        \\    }};
-        \\    const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
-        \\    const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root),
-        \\        .{{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }}, @floatCast(dpr), strategy) catch return 0;
-        \\    return @intFromPtr(app);
-        \\}}
-        \\export fn dispatchTap(app: usize, x: f32, y: f32) void {{
-        \\    if (app == 0) return;
-        \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    a.dispatchTap(x, y);
-        \\}}
-        \\export fn resize(app: usize, w: u32, h: u32, dpr: f64) void {{
-        \\    if (app == 0) return;
-        \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    a.resize(.{{ .width = @floatFromInt(w), .height = @floatFromInt(h) }}, @floatCast(dpr));
-        \\}}
-        \\// wall_ms is Date.now (settable, Unix epoch). mono_ms is the animation
-        \\// frame timestamp (monotonic, page time origin). Both are needed: the
-        \\// bar shows a time of day, the scheduler arms deadlines.
-        \\export fn tick(app: usize, wall_ms: f64, mono_ms: f64) void {{
-        \\    if (app == 0) return;
-        \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    a.tick(wall_ms, mono_ms);
-        \\}}
-        \\// The browser moved back or forward. The address bar already shows the new
-        \\// location, so this reads it back and tells the tree, rather than taking the
-        \\// new path as a string argument: a string argument would need the JS host to
-        \\// write into wasm memory, and reading the location back through the same
-        \\// DomOps hook the tree already uses needs no new plumbing.
-        \\export fn locationChanged(app: usize) void {{
-        \\    if (app == 0) return;
-        \\    const a: *phantom.web.WebApp = @ptrFromInt(app);
-        \\    a.locationChanged();
-        \\}}
-    , .{if (opts.url_strategy == .hash) "true" else "false"});
-    const entry = b.addWriteFiles().add("main.zig", entry_src);
+    // The web entry point is `build/web_entry.zig`, a real file rather than a
+    // string in this one: it imports the consumer's source as `app_root`, calls
+    // `phantom.web.init`, and exports everything the host page calls. The one
+    // per-build value it cannot work out for itself arrives as a build option.
+    const entry_options = b.addOptions();
+    entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
 
     const wasm = b.addExecutable(.{
         .name = wasm_name,
         .root_module = b.createModule(.{
-            .root_source_file = entry,
+            .root_source_file = phantom_dep.builder.path("build/web_entry.zig"),
             .target = wasm_target,
             .optimize = opts.optimize,
         }),
     });
+    wasm.root_module.addImport("build_options", entry_options.createModule());
     wasm.entry = .disabled;
     wasm.rdynamic = true;
     wasm.root_module.addImport("phantom", phantom_wasm);
@@ -386,9 +207,17 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // generated document.
     const name_html = appmeta.xmlEscape(b.allocator, opts.name.default) catch @panic("oom");
     const summary_html = appmeta.xmlEscape(b.allocator, opts.summary.default) catch @panic("oom");
-    const html_src = buildIndexHtml(b, wasm_name, runtime_import, opts.base_path, name_html, summary_html);
-    const html_lp = b.addWriteFiles().add("index.html", html_src);
+    // A prerendered route installs THIS page one directory down, where `./`
+    // resolves somewhere else, so the base tag has to be there even at the root.
+    const prerendered = opts.url_strategy == .path and opts.prerender_routes.len > 0;
+    const html_lp = b.addWriteFiles().add("index.html", buildIndexHtml(b, opts.base_path, prerendered, name_html, summary_html));
     step.dependOn(&b.addInstallFile(html_lp, b.fmt("{s}/index.html", .{dist_dir})).step);
+
+    // The page's logic, as a file beside it. See `buildIndexHtml`: an inline
+    // script is refused by any strict Content Security Policy, and a blank page
+    // with one console violation is a bad first impression of a framework.
+    const boot_lp = b.addWriteFiles().add("boot.js", buildBootJs(b, runtime_import, wasm_name));
+    step.dependOn(&b.addInstallFile(boot_lp, b.fmt("{s}/boot.js", .{dist_dir})).step);
 
     // prerender_routes only means something with the .path strategy: a .hash
     // route lives after the '#', so a host never requests the plain path and
@@ -674,64 +503,430 @@ fn addRuntimeToStep(
     return appmeta.importPathFor(strategy);
 }
 
-/// Generate a minimal index.html for the web app bundle. `base_path` fixes
-/// where a relative asset resolves from: the same file is reachable as both
-/// "/gallery" and "/gallery/", and a browser resolves "./x" differently for
-/// each, so the page cannot rely on the request's shape and needs an
-/// explicit <base> instead. `name_html` and `summary_html` are already
-/// HTML-escaped by the caller.
+/// The page itself: a shell with no logic in it at all.
+///
+/// The boot script is a FILE rather than an inline `<script>`, because an inline
+/// one is refused outright by any Content Security Policy without
+/// `'unsafe-inline'` or a nonce, and `script-src 'self'` is the ordinary strict
+/// setting. Inline, not one byte of the application runs and the page is blank
+/// with a console violation. As a file it is `'self'` and needs no policy change
+/// from anyone.
+///
+/// `<base>` is emitted only when it does something.
+///
+/// It fixes where `./boot.js` and `./app.wasm` resolve from, and it is needed in
+/// exactly two cases: an application served under a sub-path, and a prerendered
+/// route, where THE SAME page is installed at `/gallery/index.html` and would
+/// otherwise look for its script one directory down. A page served from the root
+/// with no prerendered copies needs none of that, and `base-uri 'none'` refuses
+/// the tag, so emitting it there buys a policy violation on every load and
+/// nothing else.
 fn buildIndexHtml(
     b: *std.Build,
-    wasm_name: []const u8,
-    runtime_import: []const u8,
     base_path: []const u8,
+    prerendered: bool,
     name_html: []const u8,
     summary_html: []const u8,
 ) []const u8 {
+    const base_tag = if (std.mem.eql(u8, base_path, "/") and !prerendered)
+        ""
+    else
+        b.fmt("\n    <base href=\"{s}\" />", .{base_path});
     return b.fmt(
-        \\<!doctype html>
+        \\<!DOCTYPE html>
         \\<html>
         \\  <head>
-        \\    <meta charset="utf-8" />
-        \\    <base href="{s}" />
+        \\    <meta charset="utf-8" />{s}
         \\    <title>{s}</title>
         \\    <meta name="description" content="{s}" />
         \\  </head>
         \\  <body>
-        \\    <script type="module">
-        \\      import {{ createHost }} from "{s}";
-        \\
-        \\      const host = createHost();
-        \\      const {{ instance }} = await WebAssembly.instantiateStreaming(
-        \\        fetch("./{s}.wasm"),
-        \\        host.imports,
-        \\      );
-        \\      host.attach(instance);
-        \\
-        \\      const documentHandle = host.intern(document);
-        \\      const bodyHandle = host.intern(document.body);
-        \\      const windowHandle = host.intern(window);
-        \\      const app = instance.exports.init(documentHandle, bodyHandle, windowHandle);
-        \\      document.body.addEventListener("click", (e) => instance.exports.dispatchTap(app, e.clientX, e.clientY));
-        \\      // The back/forward buttons move the address bar and then fire this,
-        \\      // with no string to pass in: the wasm side reads the new location
-        \\      // back itself, so the JS host never allocates inside the module.
-        \\      window.addEventListener("popstate", () => instance.exports.locationChanged(app));
-        \\      const onResize = () => instance.exports.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio);
-        \\      window.addEventListener("resize", onResize);
-        \\      matchMedia(`(resolution: ${{window.devicePixelRatio}}dppx)`).addEventListener("change", onResize);
-        \\      // t is the rAF timestamp: monotonic, same origin as performance.now.
-        \\      // Date.now is the wall clock and can step backwards. They are passed
-        \\      // separately because the scheduler must never arm against the second.
-        \\      const frame = (t) => {{
-        \\        instance.exports.tick(app, Date.now(), t);
-        \\        requestAnimationFrame(frame);
-        \\      }};
-        \\      requestAnimationFrame(frame);
-        \\    </script>
+        \\    <script type="module" src="./boot.js"></script>
         \\  </body>
         \\</html>
-    , .{ base_path, name_html, summary_html, runtime_import, wasm_name });
+    , .{ base_tag, name_html, summary_html });
+}
+
+/// Everything the page does, as a module served beside the wasm. See
+/// `buildIndexHtml` for why this is not inline.
+fn buildBootJs(b: *std.Build, runtime_import: []const u8, wasm_name: []const u8) []const u8 {
+    return b.fmt(
+        \\import {{ createHost }} from "{s}";
+        \\
+        \\const host = createHost();
+        \\let instance;
+        \\
+        \\// HTTP. The wasm side writes an ordinary HTTP/1.1 request into what
+        \\// it believes is a socket and then blocks reading the reply, so this
+        \\// import is the one call in the whole page that has to not return
+        \\// until the answer is in.
+        \\//
+        \\// JSPI is how that is done without freezing anything: the wasm stack
+        \\// parks and the page keeps drawing. Without it the only way to block
+        \\// is a synchronous XMLHttpRequest, which does freeze the page for the
+        \\// length of the request. Both fill the same struct and the wasm side
+        \\// cannot tell which one answered.
+        \\const jspi =
+        \\  typeof WebAssembly.Suspending === "function" &&
+        \\  typeof WebAssembly.promising === "function";
+        \\// Said out loud because the two paths behave differently in ways a
+        \\// developer will otherwise put down to something else: the fallback
+        \\// freezes the page for the length of a request and cannot carry a
+        \\// binary body. Which one is in use should never be a guess.
+        \\console.info(
+        \\  jspi
+        \\    ? "phantom: http suspends through JSPI"
+        \\    : "phantom: no JSPI here, http blocks on a synchronous XMLHttpRequest",
+        \\);
+        \\
+        \\const dec = new TextDecoder();
+        \\const enc = new TextEncoder();
+        \\const mem = () => instance.exports.memory.buffer;
+        \\const str = (ptr, len) => (len === 0 ? "" : dec.decode(new Uint8Array(mem(), ptr, len)));
+        \\
+        \\// Headers a browser owns. Setting one throws, and the browser fills
+        \\// every one of them itself, so they are dropped rather than passed on.
+        \\const forbidden = new Set([
+        \\  "host", "connection", "content-length", "transfer-encoding",
+        \\  "upgrade", "keep-alive", "te", "trailer",
+        \\]);
+        \\const parseHeaders = (block) => {{
+        \\  const out = {{}};
+        \\  for (const line of block.split("\r\n")) {{
+        \\    const i = line.indexOf(":");
+        \\    if (i <= 0) continue;
+        \\    const name = line.slice(0, i).trim().toLowerCase();
+        \\    if (forbidden.has(name)) continue;
+        \\    out[name] = line.slice(i + 1).trim();
+        \\  }}
+        \\  return out;
+        \\}};
+        \\
+        \\// Copy a string into the module's own heap and hand back its address.
+        \\// The wasm side frees both of these, so they must come from the same
+        \\// allocator the runtime uses.
+        \\const give = (s) => {{
+        \\  const bytes = enc.encode(s);
+        \\  if (bytes.length === 0) return [0, 0];
+        \\  const ptr = instance.exports.webidl_rt_alloc(bytes.length);
+        \\  if (ptr === 0) return [0, 0];
+        \\  new Uint8Array(mem(), ptr, bytes.length).set(bytes);
+        \\  return [ptr, bytes.length];
+        \\}};
+        \\// Five u32s: status, headers ptr and len, body ptr and len. Written
+        \\// last, after every allocation, because allocating can grow the heap
+        \\// and detach any view made before it.
+        \\const reply = (out, status, headers, body) => {{
+        \\  const h = give(headers);
+        \\  const b = give(body);
+        \\  new Uint32Array(mem(), out, 5).set([status, h[0], h[1], b[0], b[1]]);
+        \\  return 1;
+        \\}};
+        \\
+        \\// A request that a Content Security Policy refused and a network that is
+        \\// simply down reject a fetch the same way, with an opaque TypeError, and
+        \\// both reach the application as "the request did not happen". The most
+        \\// common cause of the first is a redirect to ANOTHER ORIGIN, which the
+        \\// browser follows and `connect-src` then refuses, so the application is
+        \\// told the network failed when what really happened is that the server
+        \\// redirected somewhere the page is not allowed to go.
+        \\//
+        \\// The browser does say which it was, just not through the fetch: it fires
+        \\// `securitypolicyviolation`. Recording the last one lets the failure path
+        \\// name the real cause, with the URI that was refused.
+        \\let lastViolation = null;
+        \\document.addEventListener("securitypolicyviolation", (e) => {{
+        \\  lastViolation = {{
+        \\    uri: e.blockedURI,
+        \\    directive: e.effectiveDirective || e.violatedDirective,
+        \\    at: performance.now(),
+        \\  }};
+        \\}});
+        \\const explainFailure = (method, url, startedAt) => {{
+        \\  const v = lastViolation;
+        \\  if (!v || v.at < startedAt) return;
+        \\  // `blockedURI` is NOT always the address that was refused, and the case
+        \\  // where it is not is the case this whole message exists for.
+        \\  //
+        \\  // A refusal inside a redirect the browser followed is reported by
+        \\  // Firefox as the ORIGINAL request url, because naming the target would
+        \\  // hand a cross-origin address to a page that was just forbidden from
+        \\  // seeing it. Other browsers withhold it as "" or as a keyword. Printing
+        \\  // it verbatim in the first case says the page's policy refused the
+        \\  // page's own same-origin url, which sends a reader off to check a
+        \\  // `connect-src 'self'` that is perfectly correct: exactly the wasted
+        \\  // afternoon this line is here to prevent.
+        \\  //
+        \\  // Matching it against what was actually asked for is what tells the two
+        \\  // apart. Equal means the browser substituted, so it disclosed nothing.
+        \\  let asked = url;
+        \\  try {{
+        \\    asked = new URL(url, location.href).href;
+        \\  }} catch {{}}
+        \\  const disclosed =
+        \\    v.uri && v.uri !== "inline" && v.uri !== "eval" && v.uri !== asked;
+        \\  const what = disclosed
+        \\    ? "refused " + v.uri
+        \\    : "refused it without saying where: a browser names the request's own " +
+        \\      "address, or none at all, when it will not disclose where a redirect led";
+        \\  console.error(
+        \\    "phantom: " + method + " " + url + " did not fail on the network. This " +
+        \\    "page's Content-Security-Policy " + what + " (" + v.directive +
+        \\    "). A redirect to another origin is the usual cause. Your application " +
+        \\    "sees this as a transport failure, because fetch does not tell the two " +
+        \\    "apart; a route whose redirect IS the answer has to be navigated to " +
+        \\    "rather than requested.",
+        \\  );
+        \\}};
+        \\
+        \\const sendAsync = async (mp, ml, up, ul, hp, hl, bp, bl, out) => {{
+        \\  const method = str(mp, ml), url = str(up, ul);
+        \\  const headers = parseHeaders(str(hp, hl));
+        \\  const body = bl === 0 ? undefined : str(bp, bl);
+        \\  const startedAt = performance.now();
+        \\  try {{
+        \\    // same-origin sends the page's cookies, which is what a session
+        \\    // rides on. manual leaves a redirect visible as a status instead
+        \\    // of following it into an opaque response nothing can read.
+        \\    //
+        \\    // "manual" was tried and is WORSE than following. The spec makes
+        \\    // it an opaque-redirect response: status 0, no headers, no body.
+        \\    // So a 303 would reach the wasm as `HTTP/1.1 0` with nothing in
+        \\    // it, which is less use than the page the redirect led to. The
+        \\    // browser follows it instead, which also means the client's own
+        \\    // redirect handling never sees a 3xx and never engages.
+        \\    //
+        \\    // WHAT AN APPLICATION LOSES: it cannot see that a redirect happened
+        \\    // at all, only where it ended up. A route whose 3xx IS the answer, a
+        \\    // sign-in that answers 303 to an identity provider, cannot be driven
+        \\    // through the client and has to be reached by navigating instead.
+        \\    const res = await fetch(url, {{
+        \\      method, headers, body,
+        \\      credentials: "same-origin",
+        \\      redirect: "follow",
+        \\    }});
+        \\    return reply(out, res.status, headerBlock(res.headers), await res.text());
+        \\  }} catch {{
+        \\    // The request never happened. Zero here is NOT a status: the wasm
+        \\    // side reads it as "nothing answered", which is a different thing
+        \\    // to report than any reply a server could send.
+        \\    explainFailure(method, url, startedAt);
+        \\    return 0;
+        \\  }}
+        \\}};
+        \\const headerBlock = (h) => {{
+        \\  let s = "";
+        \\  for (const [k, v] of h) s += k + ": " + v + "\r\n";
+        \\  return s;
+        \\}};
+        \\
+        \\const sendSync = (mp, ml, up, ul, hp, hl, bp, bl, out) => {{
+        \\  const method = str(mp, ml), url = str(up, ul);
+        \\  const headers = parseHeaders(str(hp, hl));
+        \\  const body = bl === 0 ? null : str(bp, bl);
+        \\  const startedAt = performance.now();
+        \\  try {{
+        \\    const xhr = new XMLHttpRequest();
+        \\    xhr.open(method, url, false);
+        \\    xhr.withCredentials = true;
+        \\    for (const k of Object.keys(headers)) xhr.setRequestHeader(k, headers[k]);
+        \\    xhr.send(body);
+        \\    return reply(out, xhr.status, xhr.getAllResponseHeaders(), xhr.responseText);
+        \\  }} catch {{
+        \\    explainFailure(method, url, startedAt);
+        \\    return 0;
+        \\  }}
+        \\}};
+        \\
+        \\// Styling, through the CSSOM. A `style` ATTRIBUTE and the TEXT of a
+        \\// `<style>` element are both markup, and a Content Security Policy without
+        \\// `'unsafe-inline'` refuses both, which blanks a page that positions every
+        \\// node with one. Assignment through `element.style` is not refused: the
+        \\// policy's `script-src` already decided whether script runs at all, so a
+        \\// script reaching the CSSOM adds nothing an attacker did not already have.
+        \\//
+        \\// The declaration is split here rather than in wasm so that a node still
+        \\// costs ONE crossing, exactly as the attribute did, instead of one per
+        \\// property. Splitting on ";" is safe for what this backend emits: colours
+        \\// are `rgba(1,2,3,0.5)`, which carries commas and never a semicolon.
+        \\const setStyle = (node, ptr, len) => {{
+        \\  const el = host.value(node);
+        \\  if (!el) return;
+        \\  for (const part of str(ptr, len).split(";")) {{
+        \\    const i = part.indexOf(":");
+        \\    if (i <= 0) continue;
+        \\    el.style.setProperty(part.slice(0, i).trim(), part.slice(i + 1).trim());
+        \\  }}
+        \\}};
+        \\
+        \\// Rules go into the element's SHEET, for the same reason and with one extra
+        \\// condition: a style element that is not yet in the document has no sheet,
+        \\// so the caller appends it first. A rule the browser will not parse throws
+        \\// rather than being ignored, and one bad rule must not cost the rest of the
+        \\// frame, so each is tried on its own.
+        \\const addRule = (node, ptr, len) => {{
+        \\  const el = host.value(node);
+        \\  const sheet = el && el.sheet;
+        \\  if (!sheet) return;
+        \\  for (const rule of splitRules(str(ptr, len))) {{
+        \\    try {{
+        \\      sheet.insertRule(rule, sheet.cssRules.length);
+        \\    }} catch (e) {{
+        \\      console.warn("phantom: a style rule was refused: " + rule, e);
+        \\    }}
+        \\  }}
+        \\}};
+        \\// One rule per `}}` at nesting depth zero. `@font-face {{ ... }}` and
+        \\// `.pb0:hover {{ ... }}` both come through here, so a plain split on "}}"
+        \\// would cut an at-rule in half.
+        \\const splitRules = (css) => {{
+        \\  const out = [];
+        \\  let depth = 0, start = 0;
+        \\  for (let i = 0; i < css.length; i++) {{
+        \\    if (css[i] === "{{") depth++;
+        \\    else if (css[i] === "}}" && --depth === 0) {{
+        \\      const rule = css.slice(start, i + 1).trim();
+        \\      if (rule) out.push(rule);
+        \\      start = i + 1;
+        \\    }}
+        \\  }}
+        \\  return out;
+        \\}};
+        \\
+        \\const imports = {{
+        \\  ...host.imports,
+        \\  phantom: {{
+        \\    __phantom_http_send: jspi ? new WebAssembly.Suspending(sendAsync) : sendSync,
+        \\    __phantom_set_style: setStyle,
+        \\    __phantom_add_rule: addRule,
+        \\  }},
+        \\}};
+        \\({{ instance }} = await WebAssembly.instantiateStreaming(fetch("./{s}.wasm"), imports));
+        \\host.attach(instance);
+        \\
+        \\// Under JSPI an export that can reach a suspending import has to be
+        \\// wrapped, and it then returns a promise. Everything that can run
+        \\// application code can reach one, so all of them are wrapped.
+        \\const wrap = (f) => (jspi ? WebAssembly.promising(f) : f);
+        \\const ex = instance.exports;
+        \\const w = {{
+        \\  init: wrap(ex.init), tick: wrap(ex.tick), resize: wrap(ex.resize),
+        \\  dispatchTap: wrap(ex.dispatchTap), dispatchKey: wrap(ex.dispatchKey),
+        \\  dispatchChar: wrap(ex.dispatchChar), dispatchText: wrap(ex.dispatchText),
+        \\  locationChanged: wrap(ex.locationChanged),
+        \\}};
+        \\
+        \\// True while the tree is on the stack, which under JSPI includes the
+        \\// whole time a request is parked. Re-entering it there would build and
+        \\// paint from inside a half-finished frame, so events that arrive
+        \\// meanwhile are dropped. The synchronous path cannot deliver an event
+        \\// mid-call at all, so this costs it nothing.
+        \\let busy = false;
+        \\const enter = async (f) => {{
+        \\  if (busy) return 0;
+        \\  busy = true;
+        \\  try {{ return await f(); }} finally {{ busy = false; }}
+        \\}};
+        \\
+        \\const documentHandle = host.intern(document);
+        \\const bodyHandle = host.intern(document.body);
+        \\const windowHandle = host.intern(window);
+        \\const app = await w.init(documentHandle, bodyHandle, windowHandle);
+        \\document.body.addEventListener("click", (e) => enter(() => w.dispatchTap(app, e.clientX, e.clientY)));
+        \\
+        \\// The keyboard. These numbers are X11 keysyms, which is what
+        \\// phantom.input.Keysym holds: the wasm side takes each one as it is, so
+        \\// this table is the whole keymap. A pair is [left, right].
+        \\const KEYSYMS = {{
+        \\  Backspace: 0xff08, Tab: 0xff09, Enter: 0xff0d, Escape: 0xff1b,
+        \\  Home: 0xff50, ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53,
+        \\  ArrowDown: 0xff54, PageUp: 0xff55, PageDown: 0xff56, End: 0xff57,
+        \\  Insert: 0xff63, Delete: 0xffff,
+        \\  F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+        \\  F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+        \\  Shift: [0xffe1, 0xffe2], Control: [0xffe3, 0xffe4],
+        \\  Alt: [0xffe9, 0xffea], Meta: [0xffeb, 0xffec],
+        \\}};
+        \\const keysymOf = (e) => {{
+        \\  const sym = KEYSYMS[e.key];
+        \\  if (sym === undefined) return undefined;
+        \\  // DOM_KEY_LOCATION_RIGHT is 2, which is the right hand key of a pair.
+        \\  return Array.isArray(sym) ? sym[e.location === 2 ? 1 : 0] : sym;
+        \\}};
+        \\const modsOf = (e) =>
+        \\  (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+        \\const onKey = (e, action) => {{
+        \\  // An IME owns the keys that compose a word. They arrive here as well,
+        \\  // and typing them would put the raw keys next to the word the IME
+        \\  // commits. keyCode 229 is what a browser sends while composing.
+        \\  if (e.isComposing || e.keyCode === 229) return;
+        \\  const sym = keysymOf(e);
+        \\  // preventDefault has to be called during the event, and under JSPI
+        \\  // the dispatch answers with a promise, so its answer arrives too
+        \\  // late to decide with. `focusHeld` is the synchronous stand-in: a
+        \\  // tree holding the keyboard is a tree the key belongs to, which is
+        \\  // the same rule a browser applies to a focused input. Tab is added
+        \\  // because it enters the tree even when nothing is focused yet.
+        \\  const claimed = jspi
+        \\    ? ex.focusHeld(app) !== 0 || e.key === "Tab"
+        \\    : null;
+        \\  let used;
+        \\  if (sym !== undefined) {{
+        \\    used = w.dispatchKey(app, sym, modsOf(e), action);
+        \\  }} else {{
+        \\    // Everything else that is one character long is printable. `key`
+        \\    // holds the character the layout and the shift state resolved to.
+        \\    const chars = [...e.key];
+        \\    if (chars.length !== 1) return;
+        \\    used = w.dispatchChar(app, chars[0].codePointAt(0), modsOf(e), action);
+        \\  }}
+        \\  if (claimed === null ? used : claimed) e.preventDefault();
+        \\}};
+        \\window.addEventListener("keydown", (e) => enter(() => onKey(e, e.repeat ? 1 : 0)));
+        \\window.addEventListener("keyup", (e) => enter(() => onKey(e, 2)));
+        \\
+        \\// A whole string at once. The wasm side owns the bytes, so it hands back
+        \\// an address to write them into. Read `memory.buffer` AFTER that call:
+        \\// growing the heap detaches the ArrayBuffer that was there before.
+        \\const sendText = (text) => {{
+        \\  if (!text) return false;
+        \\  const bytes = new TextEncoder().encode(text);
+        \\  const ptr = ex.textBuffer(bytes.length);
+        \\  if (ptr === 0) return false;
+        \\  new Uint8Array(mem(), ptr, bytes.length).set(bytes);
+        \\  return w.dispatchText(app, ptr, bytes.length);
+        \\}};
+        \\// A paste fires no keydown at all. An invite code, a password or a URL is
+        \\// pasted far more often than it is typed, so a page that only reads keys
+        \\// looks broken rather than unfinished.
+        \\window.addEventListener("paste", (e) => {{
+        \\  // No clipboardData at all on a paste a browser will not let a page
+        \\  // read. `sendText` refuses the empty string, so both end the same way.
+        \\  // A paste is always the tree's to take when a field holds the
+        \\  // keyboard, and the answer under JSPI arrives too late to ask.
+        \\  if (ex.focusHeld(app) !== 0) e.preventDefault();
+        \\  enter(() => sendText(e.clipboardData?.getData("text")));
+        \\}});
+        \\// The IME commits its finished word here, after the keys that composed it
+        \\// went to the IME and never reached the page.
+        \\window.addEventListener("compositionend", (e) => enter(() => sendText(e.data)));
+        \\
+        \\// The back/forward buttons move the address bar and then fire this,
+        \\// with no string to pass in: the wasm side reads the new location
+        \\// back itself, so the JS host never allocates inside the module.
+        \\window.addEventListener("popstate", () => enter(() => w.locationChanged(app)));
+        \\const onResize = () => enter(() => w.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio));
+        \\window.addEventListener("resize", onResize);
+        \\matchMedia(`(resolution: ${{window.devicePixelRatio}}dppx)`).addEventListener("change", onResize);
+        \\// t is the rAF timestamp: monotonic, same origin as performance.now.
+        \\// Date.now is the wall clock and can step backwards. They are passed
+        \\// separately because the scheduler must never arm against the second.
+        \\const frame = (t) => {{
+        \\  enter(() => w.tick(app, Date.now(), t));
+        \\  requestAnimationFrame(frame);
+        \\}};
+        \\requestAnimationFrame(frame);
+    , .{ runtime_import, wasm_name });
 }
 
 fn execName(b: *std.Build, id: []const u8, exec_name: ?[]const u8) []const u8 {

@@ -2,6 +2,7 @@ const geom = @import("geometry.zig");
 const render_object = @import("render_object.zig");
 const pointer = @import("pointer.zig");
 const widget = @import("widget.zig");
+const focus = @import("focus.zig");
 
 const Element = widget.Element;
 
@@ -47,6 +48,32 @@ fn walkScroll(el: *Element, point: geom.PhysicalOffset, found: *?*pointer.Pointe
     }
     if (el.child) |c| walkScroll(c, point, found);
     for (el.children.items) |c| walkScroll(c, point, found);
+}
+
+/// Walk the element tree (pre-order) and return the DEEPEST render object's focus
+/// handlers whose absolute bounds contain the point, or null when the point is on
+/// nothing that takes the keyboard.
+///
+/// The pointer walk above cannot answer this. A `Focus` installs no pointer
+/// handlers, so a tapped text field is invisible to `hitTest`, and the two kinds of
+/// handler sit on different render objects anyway: `TextField` puts the pointer
+/// target (if a caller wraps one around it) outside the `Focus` that holds the keys.
+/// Deepest wins for the same reason it does for the pointer: an inner field inside
+/// an outer focusable panel is the one the user aimed at.
+pub fn hitTestFocus(root: *Element, point: geom.PhysicalOffset) ?*focus.FocusHandlers {
+    var found: ?*focus.FocusHandlers = null;
+    walkFocus(root, point, &found);
+    return found;
+}
+
+fn walkFocus(el: *Element, point: geom.PhysicalOffset, found: *?*focus.FocusHandlers) void {
+    if (el.render_object) |ro| {
+        if (ro.focus) |h| {
+            if (contains(ro.origin, ro.size, point)) found.* = h;
+        }
+    }
+    if (el.child) |c| walkFocus(c, point, found);
+    for (el.children.items) |c| walkFocus(c, point, found);
 }
 
 /// A key, identified by its X11 keysym. The values match the ones Midstall's

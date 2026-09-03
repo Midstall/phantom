@@ -40,6 +40,42 @@ pub const DomOps = struct {
     /// route is a different, shorter one than the browser actually shows, so
     /// the caller must refuse it rather than take the shortened copy.
     read_location: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Writes the query string, with no leading "?", into `buf` and returns the
+    /// written part. Null when it does not fit, on the same rule
+    /// `read_location` follows. Null on a host with no address to read.
+    read_query: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Writes the host the page is served from, with no port on it. Null when it
+    /// does not fit. An application needs it to name its own server in a URL.
+    read_host: ?*const fn (ctx: *anyopaque, buf: []u8) ?[]const u8 = null,
+    /// Applies a whole `name:value;name:value` declaration to a node through
+    /// the CSSOM, one property at a time.
+    ///
+    /// A `style` ATTRIBUTE is markup, and a Content Security Policy without
+    /// `'unsafe-inline'` refuses every one of them: a page positioned this way
+    /// draws nothing and fills the console. Assigning through the style object
+    /// instead is not refused, because `script-src` already stopped an attacker
+    /// running any script at all, so the CSSOM adds no way in. Same result, same
+    /// declaration, and a policy nobody has to loosen.
+    ///
+    /// Null falls back to `set_attribute`, which keeps a host written before this
+    /// existed working, at the cost of needing `'unsafe-inline'`.
+    set_style: ?*const fn (ctx: *anyopaque, node: u32, decl: []const u8) void = null,
+    /// Adds one rule to a `<style>` element's sheet through the CSSOM, for the
+    /// same reason: the TEXT of a style element is markup too, so a policy
+    /// refuses it however the element itself was made. The element must already
+    /// be in the document, because a detached one has no sheet to add to.
+    ///
+    /// Null falls back to `set_text_content`.
+    add_rule: ?*const fn (ctx: *anyopaque, style_node: u32, rule: []const u8) void = null,
+    /// Fills `buf` with cryptographically secure random bytes and reports
+    /// whether it managed to. This is `crypto.getRandomValues` on a browser.
+    ///
+    /// A host that leaves it null has no random source at all, which is not the
+    /// same as a source that returns zeros: `std.Io.failing`'s `noRandom` zeroes
+    /// the buffer AND reports success, so a caller drawing a key from it gets a
+    /// key of zeros and no error. Everything downstream of this hook exists to
+    /// stop that particular lie.
+    fill_random: ?*const fn (ctx: *anyopaque, buf: []u8) bool = null,
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
     /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the
@@ -64,6 +100,19 @@ pub const DomOps = struct {
     }
     pub fn setAttribute(self: DomOps, node: u32, name: []const u8, value: []const u8) void {
         self.set_attribute(self.ctx, node, name, value);
+    }
+    /// Apply a style declaration. Prefers the CSSOM hook, which a strict Content
+    /// Security Policy permits, and falls back to the `style` attribute, which it
+    /// does not. See `set_style`.
+    pub fn setStyle(self: DomOps, node: u32, decl: []const u8) void {
+        const f = self.set_style orelse return self.setAttribute(node, "style", decl);
+        f(self.ctx, node, decl);
+    }
+    /// Add one rule to a style element. Prefers the CSSOM hook for the same
+    /// reason, and falls back to setting the element's text. See `add_rule`.
+    pub fn addRule(self: DomOps, style_node: u32, rule: []const u8) void {
+        const f = self.add_rule orelse return self.setTextContent(style_node, rule);
+        f(self.ctx, style_node, rule);
     }
     pub fn setTextContent(self: DomOps, node: u32, textv: []const u8) void {
         self.set_text_content(self.ctx, node, textv);
@@ -182,7 +231,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     {
         const style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) });
         defer gpa.free(style);
-        ops.setAttribute(container, "style", style);
+        ops.setStyle(container, style);
     }
     ops.appendChild(ops.body, container);
 
@@ -216,14 +265,14 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                     const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     const node = ops.createElement("div");
-                    ops.setAttribute(node, "style", style);
+                    ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                 } else {
                     // Plain fill rrect (kept identical to Task 1).
                     const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     const node = ops.createElement("div");
-                    ops.setAttribute(node, "style", style);
+                    ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                 }
             } else {
@@ -237,7 +286,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 if (r.stroke_width > 0) {
                     const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
-                    ops.setAttribute(node, "style", style);
+                    ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
@@ -254,7 +303,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 } else {
                     const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
-                    ops.setAttribute(node, "style", style);
+                    ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
@@ -290,7 +339,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const src = try std.fmt.allocPrint(gpa, "data:{s};base64,{s}", .{ image_mod.Image.mime(im.format), b64 });
             defer gpa.free(src);
             const node = ops.createElement("img");
-            ops.setAttribute(node, "style", style);
+            ops.setStyle(node, style);
             ops.setAttribute(node, "src", src);
             ops.appendChild(parent, node);
         },
@@ -321,7 +370,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             ops.setAttribute(svg, "preserveAspectRatio", "none");
             ops.setAttribute(svg, "width", w_s);
             ops.setAttribute(svg, "height", h_s);
-            ops.setAttribute(svg, "style", style);
+            ops.setStyle(svg, style);
 
             // `<title>` is the accessible name of an inline SVG, and the first
             // child is the one a screen reader reads, so it goes in before the
@@ -381,7 +430,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, font_idx, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
             defer gpa.free(style);
             const node = ops.createElement("div");
-            ops.setAttribute(node, "style", style);
+            ops.setStyle(node, style);
             ops.setTextContent(node, run.text);
             ops.appendChild(parent, node);
         },
@@ -397,13 +446,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const outer_style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
                 defer gpa.free(outer_style);
                 const outer = ops.createElement("div");
-                ops.setAttribute(outer, "style", outer_style);
+                ops.setStyle(outer, outer_style);
                 ops.appendChild(parent, outer);
                 // Inner div: the full content area that scrolls inside the outer.
                 const inner_style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
                 defer gpa.free(inner_style);
                 const inner = ops.createElement("div");
-                ops.setAttribute(inner, "style", inner_style);
+                ops.setStyle(inner, inner_style);
                 ops.appendChild(outer, inner);
                 // This is the Nth region `render` has built this frame: give
                 // it the Nth saved offset (if there is one), then remember its
@@ -461,7 +510,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
                 defer gpa.free(style);
                 const node = ops.createElement("div");
-                ops.setAttribute(node, "style", style);
+                ops.setStyle(node, style);
                 ops.appendChild(parent, node);
                 // Children now append inside the clip; coords subtract its origin.
                 region_stack[region_depth] = .{ .parent = parent, .origin = region_origin };
@@ -486,10 +535,14 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     };
 
     // Inject a <style> with interactive rules if any were accumulated.
+    //
+    // Appended BEFORE the rules go in, and not after: a style element that is not
+    // in the document has no sheet, and `addRule` has nothing to add to. The
+    // fallback path does not care either way, so the order costs it nothing.
     if (rules.items.len > 0) {
         const style_node = ops.createElement("style");
-        ops.setTextContent(style_node, rules.items);
         ops.appendChild(ops.body, style_node);
+        ops.addRule(style_node, rules.items);
     }
 }
 
@@ -505,6 +558,15 @@ pub const Recorder = struct {
     /// to its history yet.
     location_buf: [location_cap]u8 = undefined,
     location_len: usize = 0,
+    /// The query string `read_query` reports, with no leading "?". Empty until
+    /// a test sets one, which is a page opened on an address with no query.
+    search_buf: [location_cap]u8 = undefined,
+    search_len: usize = 0,
+    /// The host `read_host` reports. Empty until a test sets one, which reads as
+    /// a page with no host, a thing no real browser produces; a test that cares
+    /// calls `setHost` first.
+    host_buf: [location_cap]u8 = undefined,
+    host_len: usize = 0,
     /// Scroll offsets a test has set, simulating the browser. Bounded, like
     /// the rest of this mock; a test needs at most a handful of regions.
     scroll_offsets: [scroll_offsets_cap]ScrollEntry = undefined,
@@ -532,6 +594,45 @@ pub const Recorder = struct {
         if (self.location_len > buf.len) return null;
         @memcpy(buf[0..self.location_len], self.location_buf[0..self.location_len]);
         return buf[0..self.location_len];
+    }
+
+    /// Sets the query string `readQuery` reports, with no leading "?", without
+    /// recording a call. The browser keeps the query out of the path, so this is
+    /// separate from `setLocation` rather than parsed back out of it.
+    pub fn setSearch(self: *Recorder, query: []const u8) void {
+        @memcpy(self.search_buf[0..query.len], query);
+        self.search_len = query.len;
+    }
+
+    fn readQuery(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        if (self.search_len > buf.len) return null;
+        @memcpy(buf[0..self.search_len], self.search_buf[0..self.search_len]);
+        return buf[0..self.search_len];
+    }
+
+    /// Stands in for `crypto.getRandomValues`. Deterministic on purpose: a test
+    /// needs to know what it got, and what is under test is that the bytes come
+    /// from the host at all rather than from `noRandom`'s memset of zeros. The
+    /// sequence starts at 1 so a filled buffer never looks like an empty one.
+    fn fillRandom(ctx: *anyopaque, buf: []u8) bool {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("fillRandom({d})", .{buf.len});
+        for (buf, 0..) |*b, i| b.* = @truncate(i +% 1);
+        return true;
+    }
+
+    /// Sets the host `readHost` reports, without recording a call.
+    pub fn setHost(self: *Recorder, host: []const u8) void {
+        @memcpy(self.host_buf[0..host.len], host);
+        self.host_len = host.len;
+    }
+
+    fn readHost(ctx: *anyopaque, buf: []u8) ?[]const u8 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        if (self.host_len > buf.len) return null;
+        @memcpy(buf[0..self.host_len], self.host_buf[0..self.host_len]);
+        return buf[0..self.host_len];
     }
 
     fn writeLocation(ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void {
@@ -609,6 +710,19 @@ pub const Recorder = struct {
         self.rec("setAttribute({d},{s},{s})", .{ node, name, value });
     }
 
+    /// Recorded under its own name, not as `setAttribute(n,style,...)`, because
+    /// the difference between the two IS the thing under test: one is markup a
+    /// Content Security Policy refuses and the other is not.
+    fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("setStyle({d},{s})", .{ node, decl });
+    }
+
+    fn addRule(ctx: *anyopaque, style_node: u32, rule: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("addRule({d},{s})", .{ style_node, rule });
+    }
+
     fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.rec("setTextContent({d},{s})", .{ node, textv });
@@ -637,6 +751,11 @@ pub const Recorder = struct {
             .body = 1,
             .head = 2,
             .read_location = readLocation,
+            .read_query = readQuery,
+            .read_host = readHost,
+            .set_style = setStyle,
+            .add_rule = addRule,
+            .fill_random = fillRandom,
             .write_location = writeLocation,
             .read_scroll_offset = readScrollOffset,
             .write_scroll_offset = writeScrollOffset,
@@ -1039,7 +1158,9 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
     try std.testing.expect(contains(rec.log.items, "viewBox,0 0 24 24"));
     try std.testing.expect(contains(rec.log.items, "width,40"));
     try std.testing.expect(contains(rec.log.items, "height,40"));
-    try std.testing.expect(contains(rec.log.items, "style,position:absolute;left:6px;top:9px"));
+    // Through the CSSOM, not as a `style` attribute: the attribute form is what
+    // a strict Content Security Policy refuses.
+    try std.testing.expect(contains(rec.log.items, "setStyle(") and contains(rec.log.items, "position:absolute;left:6px;top:9px"));
     // A stroked centreline, not a filled outline.
     try std.testing.expect(contains(rec.log.items, "fill,none"));
     try std.testing.expect(contains(rec.log.items, "stroke-width,1.7"));
@@ -1258,4 +1379,60 @@ test "dom_calls: a host with no scroll offset hooks still renders a scroll regio
     // The region is still remembered, so a host that gains the hooks later
     // starts carrying its offset from the very next render.
     try std.testing.expectEqual(@as(usize, 1), mem.count);
+}
+
+test "dom_calls: a rendered frame sets no style ATTRIBUTE anywhere, because a strict policy refuses every one" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 1, .y = 2, .width = 3, .height = 4 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+
+    // The whole point of the change, stated as the thing that must not happen.
+    // A single one of these blanks the page under `style-src` without
+    // `'unsafe-inline'`, so the assertion is on the absence, not on a sample.
+    for (rec.log.items) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line, "setAttribute(") == null or
+            std.mem.indexOf(u8, line, ",style,") == null);
+    }
+    // And the positioning really did happen, so the loop above is not passing
+    // because nothing was drawn.
+    try std.testing.expect(contains(rec.log.items, "setStyle("));
+    try std.testing.expect(contains(rec.log.items, "position:absolute"));
+    // The interactive rule went through the sheet rather than the element text.
+    try std.testing.expect(contains(rec.log.items, "addRule("));
+    try std.testing.expect(!contains(rec.log.items, "setTextContent"));
+}
+
+test "dom_calls: a host with no CSSOM hooks still renders, through the attribute it can use" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var ops_no_cssom = rec.ops();
+    // A host written before these hooks existed. It needs `'unsafe-inline'`, and
+    // that is its choice to make, but it must not stop drawing.
+    ops_no_cssom.set_style = null;
+    ops_no_cssom.add_rule = null;
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 1, .y = 2, .width = 3, .height = 4 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try render(gpa, ops_no_cssom, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+
+    try std.testing.expect(contains(rec.log.items, ",style,position:absolute"));
+    try std.testing.expect(contains(rec.log.items, "setTextContent"));
+    try std.testing.expect(!contains(rec.log.items, "setStyle("));
 }
