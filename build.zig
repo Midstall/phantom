@@ -7,6 +7,12 @@ pub const LocalizedText = appmeta.LocalizedText;
 pub const Icon = appmeta.Icon;
 pub const AppOptions = appmeta.AppOptions;
 
+/// Where a web build serves the built-in fonts, relative to the page. Must match
+/// `phantom.text.builtin.font_dir`, which is what the `@font-face` rules point
+/// at: the runtime writes the url and this installs the file it names, so the two
+/// halves of that agreement live one constant apart.
+const phantom_font_dir = "fonts/";
+
 pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
     const t = opts.target.result;
     const phantom_mod = phantom_dep.module("phantom");
@@ -218,6 +224,27 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // with one console violation is a bad first impression of a framework.
     const boot_lp = b.addWriteFiles().add("boot.js", buildBootJs(b, runtime_import, wasm_name));
     step.dependOn(&b.addInstallFile(boot_lp, b.fmt("{s}/boot.js", .{dist_dir})).step);
+
+    // The built-in fonts, as files, for the same reason and a sharper one.
+    //
+    // The alternative is a `@font-face` whose `src` embeds the bytes as a
+    // `data:` URL, and `font-src 'self'` refuses that: `font-src` governs where
+    // the RESOURCE is fetched from, so no amount of CSSOM changes the answer.
+    // A refused font is not an appearance problem. Layout was measured against
+    // this font and the browser substitutes another, so the glyphs a person sees
+    // and the rectangles their taps are tested against stop agreeing, and the
+    // buttons on the page quietly misaim.
+    //
+    // All of them are installed, not only the ones an application draws with,
+    // because which fonts a tree uses is decided when it builds and this is
+    // decided now. An unreferenced file is never fetched: only a `@font-face`
+    // that some text actually matches costs a request.
+    for ([_][]const u8{ "Neuropol.otf", "Mesmerize Rg.otf", "Mesmerize Sb.otf" }) |font_file| {
+        step.dependOn(&b.addInstallFile(
+            phantom_dep.builder.path(b.fmt("lib/phantom/text/fonts/{s}", .{font_file})),
+            b.fmt("{s}/{s}{s}", .{ dist_dir, phantom_font_dir, font_file }),
+        ).step);
+    }
 
     // prerender_routes only means something with the .path strategy: a .hash
     // route lives after the '#', so a host never requests the plain path and

@@ -101,15 +101,19 @@ pub const ThemeData = struct {
 pub fn defaultTheme(owner: *BuildOwner) *const ThemeData {
     if (owner.default_theme != null) return &owner.default_theme.?;
     if (owner.default_heading_font == null) {
-        owner.default_heading_font = Font.load(owner.gpa, builtin_fonts.neuropol_bytes) catch
+        // Through the loader, not `Font.load` on the raw bytes: the loader is
+        // what records where the font is served from, and a font with nowhere
+        // to be fetched from is embedded in the stylesheet as a `data:` URL,
+        // which `font-src 'self'` refuses. See `text.Font.url`.
+        owner.default_heading_font = builtin_fonts.neuropol(owner.gpa) catch
             panic("default theme: Neuropol failed to load (corrupt embed)", .{});
     }
     if (owner.default_body_font == null) {
-        owner.default_body_font = Font.load(owner.gpa, builtin_fonts.mesmerize_rg_bytes) catch
+        owner.default_body_font = builtin_fonts.mesmerize_rg(owner.gpa) catch
             panic("default theme: Mesmerize failed to load (corrupt embed)", .{});
     }
     if (owner.default_body_bold_font == null) {
-        owner.default_body_bold_font = Font.load(owner.gpa, builtin_fonts.mesmerize_sb_bytes) catch
+        owner.default_body_bold_font = builtin_fonts.mesmerize_sb(owner.gpa) catch
             panic("default theme: Mesmerize Sb failed to load (corrupt embed)", .{});
     }
     const colors = ColorScheme.tokyoNight();

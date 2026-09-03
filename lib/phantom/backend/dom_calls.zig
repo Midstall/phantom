@@ -138,15 +138,47 @@ pub const DomOps = struct {
 
 /// Build the @font-face CSS block for a list of fonts. Call once at init and
 /// inject a single <style> into <head>. Caller owns the returned slice.
+/// The CSS family name for a font.
+///
+/// Derived from the font's own address, NOT from its position in a collected
+/// list, and that is a correctness fix rather than a style choice. The faces are
+/// declared once from the fonts the FIRST render used, while every later frame
+/// names a font by its index in ITS OWN collection. A frame whose text uses a
+/// different set, or the same set in a different order, would then ask for a
+/// family that was declared for another font, and the page would draw in the
+/// wrong one with nothing to indicate it. An address is the same in both places
+/// by construction, so the two cannot drift apart.
+pub fn fontFamily(buf: []u8, font_ptr: *const text.Font) []const u8 {
+    return std.fmt.bufPrint(buf, "pf{x}", .{@intFromPtr(font_ptr)}) catch "pf0";
+}
+
+/// The buffer `fontFamily` needs: "pf" and a pointer in hex.
+pub const family_len = 2 + @sizeOf(usize) * 2;
+
+/// Build the `@font-face` block for a list of fonts. Call once at init and add
+/// the rules to a single sheet. Caller owns the returned slice.
+///
+/// A font that says where it is served from is referenced BY URL. One that does
+/// not has its bytes embedded in the rule as a `data:` URL, which is the only
+/// thing left to do with it, and which `font-src 'self'` refuses: see
+/// `text.Font.url` for why that matters more than it looks.
 pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    for (fonts, 0..) |font_ptr, i| {
+    for (fonts) |font_ptr| {
+        var fam: [family_len]u8 = undefined;
+        const family = fontFamily(&fam, font_ptr);
+        if (font_ptr.url) |url| {
+            const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
+            defer gpa.free(face);
+            try buf.appendSlice(gpa, face);
+            continue;
+        }
         const enc = std.base64.standard.Encoder;
         const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
         defer gpa.free(b64);
         _ = enc.encode(b64, font_ptr.bytes);
-        const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:pf{d};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ i, b64 });
+        const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ family, b64 });
         defer gpa.free(face);
         try buf.appendSlice(gpa, face);
     }
@@ -413,13 +445,12 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const ox: f32 = if (region_origin) |o| o.x else 0;
             const oy: f32 = if (region_origin) |o| o.y else 0;
             const font_ptr: *text.Font = @ptrCast(@alignCast(run.font));
-            var font_idx: usize = 0;
-            for (fonts, 0..) |fp, i| {
-                if (fp == font_ptr) {
-                    font_idx = i;
-                    break;
-                }
-            } else unreachable;
+            // Named by the font itself, not by where it landed in this frame's
+            // collection. See `fontFamily`: the faces were declared once from
+            // the first frame's fonts, so an index would name a different font
+            // the moment a later frame used a different set.
+            var fam: [family_len]u8 = undefined;
+            const family = fontFamily(&fam, font_ptr);
             var tbuf: [8]u8 = undefined;
             // `white-space:pre` because this framework already decided where
             // every line breaks and how wide each run is. Without it a browser
@@ -427,7 +458,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             // spaces to one, drops the leading spaces of a line, and may break
             // the run again at a width of its own choosing. Indented source in
             // a code block loses its indentation to exactly that.
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, font_idx, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
+            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, family, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
             defer gpa.free(style);
             const node = ops.createElement("div");
             ops.setStyle(node, style);
@@ -793,7 +824,7 @@ test "dom_calls: fill rrect creates a styled div appended to the container" {
     try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:30px;height:40px;border-radius:4px;background:rgba(255,0,0,1)"));
 }
 
-test "dom_calls: text primitive records setTextContent with raw string and font-family:pf0 style" {
+test "dom_calls: a text primitive names its font the same way the font-face does" {
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
@@ -813,8 +844,19 @@ test "dom_calls: text primitive records setTextContent with raw string and font-
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
     // The raw string is passed directly (browser handles escaping).
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "<b>hi</b>"));
-    // The style div must carry font-family:pf0.
-    try std.testing.expect(contains(rec.log.items, "font-family:pf0"));
+    // The family the run asks for must be the one the face was declared under.
+    // Comparing the two rather than pinning a literal is the whole point: an
+    // index satisfied a literal happily while naming a different font on any
+    // frame whose text used a different set.
+    var fam: [family_len]u8 = undefined;
+    const family = fontFamily(&fam, &font);
+    const decl = try fontFaceCss(gpa, &.{&font});
+    defer gpa.free(decl);
+    try std.testing.expect(std.mem.indexOf(u8, decl, family) != null);
+
+    var want: [family_len + 12]u8 = undefined;
+    const asked = try std.fmt.bufPrint(&want, "font-family:{s}", .{family});
+    try std.testing.expect(contains(rec.log.items, asked));
 }
 
 test "dom_calls: stroke rrect records a border:...solid rgba style" {
@@ -1435,4 +1477,54 @@ test "dom_calls: a host with no CSSOM hooks still renders, through the attribute
     try std.testing.expect(contains(rec.log.items, ",style,position:absolute"));
     try std.testing.expect(contains(rec.log.items, "setTextContent"));
     try std.testing.expect(!contains(rec.log.items, "setStyle("));
+}
+
+test "dom_calls: a font that is served as a file is referenced by url, never embedded" {
+    const gpa = std.testing.allocator;
+    var font = try text.builtin.neuropol(gpa);
+    defer font.deinit(gpa);
+
+    const css = try fontFaceCss(gpa, &.{&font});
+    defer gpa.free(css);
+
+    // `font-src 'self'` refuses a `data:` URL however the rule reached the
+    // document, and a refused font is not a cosmetic problem: layout was
+    // measured against this font, so the glyphs a person sees and the rectangles
+    // taps are tested against stop agreeing.
+    try std.testing.expect(std.mem.indexOf(u8, css, "data:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "url(\"fonts/Neuropol.otf\")") != null);
+}
+
+test "dom_calls: a font with nowhere to be fetched from still works, embedded" {
+    const gpa = std.testing.allocator;
+    // What an application's own font looks like: loaded from bytes, served from
+    // nowhere. It needs `font-src data:`, and that is the application's call.
+    var font = try text.Font.load(gpa, text.builtin.mesmerize_rg_bytes);
+    defer font.deinit(gpa);
+    try std.testing.expectEqual(@as(?[]const u8, null), font.url);
+
+    const css = try fontFaceCss(gpa, &.{&font});
+    defer gpa.free(css);
+    try std.testing.expect(std.mem.indexOf(u8, css, "data:font/otf;base64,") != null);
+}
+
+test "dom_calls: two fonts get two different families, so neither can answer for the other" {
+    const gpa = std.testing.allocator;
+    var a = try text.builtin.neuropol(gpa);
+    defer a.deinit(gpa);
+    var b = try text.builtin.mesmerize_rg(gpa);
+    defer b.deinit(gpa);
+
+    var fam_a: [family_len]u8 = undefined;
+    var fam_b: [family_len]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, fontFamily(&fam_a, &a), fontFamily(&fam_b, &b)));
+
+    // And the order they are declared in does not change what either is called,
+    // which is exactly what an index could not promise.
+    const one = try fontFaceCss(gpa, &.{ &a, &b });
+    defer gpa.free(one);
+    const other = try fontFaceCss(gpa, &.{ &b, &a });
+    defer gpa.free(other);
+    try std.testing.expect(std.mem.indexOf(u8, one, fontFamily(&fam_a, &a)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, other, fontFamily(&fam_a, &a)) != null);
 }

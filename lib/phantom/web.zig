@@ -1499,3 +1499,29 @@ test "a host with no hook is null, so a native backend cannot be mistaken for a 
     var buf: [64]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), app.owner.platform.readHost(&buf));
 }
+
+fn textRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Text{ .text = "sign in" }).widget();
+}
+
+test "a page drawn with the default theme embeds no font, so a strict font-src can refuse data urls" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The default theme is what almost every page draws with, and it used to
+    // reach `Font.load` on the raw bytes, which records no url and so embeds the
+    // whole font in the stylesheet. Under `font-src 'self'` the browser refuses
+    // it and substitutes another font, and then the glyphs a person sees and the
+    // rectangles their taps are tested against stop agreeing.
+    var embedded = false;
+    var referenced = false;
+    for (rec.log.items) |line| {
+        if (std.mem.indexOf(u8, line, "data:font/otf") != null) embedded = true;
+        if (std.mem.indexOf(u8, line, "url(\"fonts/") != null) referenced = true;
+    }
+    try std.testing.expect(!embedded);
+    try std.testing.expect(referenced);
+}

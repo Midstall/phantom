@@ -22,6 +22,22 @@ metrics: Metrics,
 format: Sfnt.OutlineFormat,
 cff: ?Cff,
 cache: GlyphCache,
+/// Where this font can be fetched from, relative to the page, when it is served
+/// as a file. Null when it is not, which is every font an application loaded
+/// from its own bytes.
+///
+/// Only the web backend reads it, and it is what keeps a page working under a
+/// Content Security Policy. The alternative is embedding the bytes in the
+/// stylesheet as a `data:` URL, and `font-src 'self'` refuses that however the
+/// rule reached the document, because `font-src` governs where the RESOURCE
+/// comes from and not where the style did. A refused font is worse than it
+/// sounds: layout was measured against this font and the browser substitutes
+/// another, so the glyphs a person sees and the rectangles taps are tested
+/// against stop agreeing.
+///
+/// Every other backend ignores it: a terminal and a compositor rasterize from
+/// `bytes` and have nothing to fetch.
+url: ?[]const u8 = null,
 
 /// Parse the font bytes and return an initialized Font.
 /// Caller owns the bytes slice (Font does not copy it).
