@@ -792,31 +792,63 @@ fn buildBootJs(b: *std.Build, runtime_import: []const u8, wasm_name: []const u8)
         \\  }}
         \\}};
         \\
-        \\// Rules go into the element's SHEET, for the same reason and with one extra
-        \\// condition: a style element that is not yet in the document has no sheet,
-        \\// so the caller appends it first. A rule the browser will not parse throws
-        \\// rather than being ignored, and one bad rule must not cost the rest of the
-        \\// frame, so each is tried on its own.
-        \\const addRule = (node, ptr, len) => {{
-        \\  const el = host.value(node);
-        \\  const sheet = el && el.sheet;
-        \\  // Said out loud rather than returned from quietly. A missing sheet
-        \\  // means every rule for it is dropped, and the page then renders
-        \\  // ALMOST right, which is the hardest kind of wrong to find: no hover
-        \\  // states and fallback fonts, with nothing anywhere saying why.
-        \\  if (!sheet) {{
-        \\    console.warn(
-        \\      "phantom: a style element has no sheet, so its rules were dropped. " +
-        \\      "It has to be in the document before any rule is added to it.",
-        \\    );
-        \\    return;
+        \\// Rules go into a CONSTRUCTABLE sheet, one the document adopts, and never
+        \\// into a `<style>` element.
+        \\//
+        \\// A style element cannot be used under a strict policy at all. It is
+        \\// markup, so `style-src 'self'` refuses the ELEMENT the moment it enters
+        \\// the document, while it is still empty: a browser reports that against
+        \\// `style-src-elem` and names the hash of the empty string, which is what
+        \\// an empty style element hashes to. A refused element gets no `.sheet`,
+        \\// so putting rules in it through the CSSOM never runs either. That is
+        \\// how `@font-face` silently never applied and no font was ever fetched.
+        \\//
+        \\// A constructed sheet has no element, so there is nothing to refuse.
+        \\let pageSheet;
+        \\const sheet = () => {{
+        \\  if (pageSheet !== undefined) return pageSheet;
+        \\  try {{
+        \\    pageSheet = new CSSStyleSheet();
+        \\    document.adoptedStyleSheets = [...document.adoptedStyleSheets, pageSheet];
+        \\  }} catch (e) {{
+        \\    // Null, not undefined, so this is attempted once rather than on every
+        \\    // frame. Hover and active states are lost; nothing else is.
+        \\    pageSheet = null;
+        \\    console.warn("phantom: no constructable stylesheet, so hover and active rules are dropped", e);
         \\  }}
+        \\  return pageSheet;
+        \\}};
+        \\
+        \\// A rule the browser will not parse throws rather than being ignored, and
+        \\// one bad rule must not cost the rest of the frame, so each is tried alone.
+        \\const addRule = (ptr, len) => {{
+        \\  const s = sheet();
+        \\  if (!s) return;
         \\  for (const rule of splitRules(str(ptr, len))) {{
         \\    try {{
-        \\      sheet.insertRule(rule, sheet.cssRules.length);
+        \\      s.insertRule(rule, s.cssRules.length);
         \\    }} catch (e) {{
         \\      console.warn("phantom: a style rule was refused: " + rule, e);
         \\    }}
+        \\  }}
+        \\}};
+        \\
+        \\// A font, through `document.fonts`, with no stylesheet involved at all.
+        \\// The rules above need a sheet to live in; a face does not, and this is
+        \\// the one that must not fail quietly. A font that never registers means
+        \\// the browser substitutes another, and then the glyphs on screen and the
+        \\// rectangles taps are tested against describe two different pages.
+        \\const addFont = (fp, fl, sp, sl) => {{
+        \\  const family = str(fp, fl);
+        \\  try {{
+        \\    const face = new FontFace(family, str(sp, sl));
+        \\    document.fonts.add(face);
+        \\    // Fetched now rather than when some text first wants it, so a failure
+        \\    // is reported once, here, instead of appearing later as the wrong
+        \\    // letterforms.
+        \\    face.load().catch((e) => console.warn("phantom: the font " + family + " did not load", e));
+        \\  }} catch (e) {{
+        \\    console.warn("phantom: the font " + family + " could not be registered", e);
         \\  }}
         \\}};
         \\// One rule per `}}` at nesting depth zero. `@font-face {{ ... }}` and
@@ -842,6 +874,7 @@ fn buildBootJs(b: *std.Build, runtime_import: []const u8, wasm_name: []const u8)
         \\    __phantom_http_send: jspi ? new WebAssembly.Suspending(sendAsync) : sendSync,
         \\    __phantom_set_style: setStyle,
         \\    __phantom_add_rule: addRule,
+        \\    __phantom_add_font: addFont,
         \\  }},
         \\}};
         \\({{ instance }} = await WebAssembly.instantiateStreaming(fetch("./{s}.wasm"), imports));

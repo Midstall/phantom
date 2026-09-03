@@ -63,13 +63,34 @@ pub const DomOps = struct {
     /// Null falls back to `set_attribute`, which keeps a host written before this
     /// existed working, at the cost of needing `'unsafe-inline'`.
     set_style: ?*const fn (ctx: *anyopaque, node: u32, decl: []const u8) void = null,
-    /// Adds one rule to a `<style>` element's sheet through the CSSOM, for the
-    /// same reason: the TEXT of a style element is markup too, so a policy
-    /// refuses it however the element itself was made. The element must already
-    /// be in the document, because a detached one has no sheet to add to.
+    /// Adds CSS rules to the page WITHOUT a `<style>` element anywhere.
     ///
-    /// Null falls back to `set_text_content`.
-    add_rule: ?*const fn (ctx: *anyopaque, style_node: u32, rule: []const u8) void = null,
+    /// This takes no node, and that is the whole point. A `<style>` element is
+    /// markup, and `style-src 'self'` refuses the ELEMENT ITSELF the moment it
+    /// enters the document, before a single rule is in it: a browser reports the
+    /// refusal against `style-src-elem` and names the hash of the EMPTY string,
+    /// which is what an empty style element hashes to. A refused element gets no
+    /// `.sheet`, so adding rules to it through the CSSOM never runs either. There
+    /// is no way to use one under a strict policy.
+    ///
+    /// A constructable sheet, `new CSSStyleSheet()` adopted by the document, has
+    /// no element for a policy to refuse.
+    ///
+    /// Null falls back to a `<style>` element, which works and needs
+    /// `'unsafe-inline'`.
+    add_rule: ?*const fn (ctx: *anyopaque, css: []const u8) void = null,
+    /// Registers one font face, WITHOUT a stylesheet of any kind: the `FontFace`
+    /// constructor and `document.fonts`. `src` is the CSS source descriptor, so
+    /// `url("fonts/X.otf")` for a font served as a file and a `data:` URL for one
+    /// that is not.
+    ///
+    /// Separate from `add_rule` because a font that fails to register fails in a
+    /// way nothing else does: layout was measured against it, the browser
+    /// substitutes another, and the glyphs a person sees stop lining up with the
+    /// rectangles their taps are tested against.
+    ///
+    /// Null falls back to an `@font-face` rule through `add_rule`.
+    add_font: ?*const fn (ctx: *anyopaque, family: []const u8, src: []const u8) void = null,
     /// Fills `buf` with cryptographically secure random bytes and reports
     /// whether it managed to. This is `crypto.getRandomValues` on a browser.
     ///
@@ -111,11 +132,22 @@ pub const DomOps = struct {
         const f = self.set_style orelse return self.setAttribute(node, "style", decl);
         f(self.ctx, node, decl);
     }
-    /// Add one rule to a style element. Prefers the CSSOM hook for the same
-    /// reason, and falls back to setting the element's text. See `add_rule`.
-    pub fn addRule(self: DomOps, style_node: u32, rule: []const u8) void {
-        const f = self.add_rule orelse return self.setTextContent(style_node, rule);
-        f(self.ctx, style_node, rule);
+    /// Add CSS to the page. Prefers the elementless hook, which a strict policy
+    /// permits, and falls back to a `<style>` element, which it does not. See
+    /// `add_rule`.
+    pub fn addRule(self: DomOps, css: []const u8) void {
+        if (self.add_rule) |f| return f(self.ctx, css);
+        const node = self.createElement("style");
+        self.setTextContent(node, css);
+        self.appendChild(self.body, node);
+    }
+    /// Register one font face. Prefers the elementless hook; falls back to an
+    /// `@font-face` rule, which goes wherever `addRule` goes. `buf` holds the
+    /// fallback rule and needs room for the family and the source.
+    pub fn addFont(self: DomOps, buf: []u8, family: []const u8, src: []const u8) void {
+        if (self.add_font) |f| return f(self.ctx, family, src);
+        const rule = std.fmt.bufPrint(buf, "@font-face{{font-family:{s};src:{s}}}", .{ family, src }) catch return;
+        self.addRule(rule);
     }
     pub fn setTextContent(self: DomOps, node: u32, textv: []const u8) void {
         self.set_text_content(self.ctx, node, textv);
@@ -158,13 +190,30 @@ pub fn fontFamily(buf: []u8, font_ptr: *const text.Font) []const u8 {
 /// The buffer `fontFamily` needs: "pf" and a pointer in hex.
 pub const family_len = 2 + @sizeOf(usize) * 2;
 
-/// Build the `@font-face` block for a list of fonts. Call once at init and add
-/// the rules to a single sheet. Caller owns the returned slice.
+/// The CSS source descriptor for a font: what goes after `src:` in an
+/// `@font-face` rule, and what the `FontFace` constructor takes as its second
+/// argument. Caller owns the returned slice.
 ///
 /// A font that says where it is served from is referenced BY URL. One that does
-/// not has its bytes embedded in the rule as a `data:` URL, which is the only
-/// thing left to do with it, and which `font-src 'self'` refuses: see
-/// `text.Font.url` for why that matters more than it looks.
+/// not has its bytes embedded as a `data:` URL, which is the only thing left to
+/// do with it and which `font-src 'self'` refuses: see `text.Font.url`.
+pub fn fontSrc(gpa: std.mem.Allocator, font_ptr: *const text.Font) ![]u8 {
+    if (font_ptr.url) |url| {
+        return std.fmt.allocPrint(gpa, "url(\"{s}\") format(\"opentype\")", .{url});
+    }
+    const enc = std.base64.standard.Encoder;
+    const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
+    defer gpa.free(b64);
+    _ = enc.encode(b64, font_ptr.bytes);
+    return std.fmt.allocPrint(gpa, "url(data:font/otf;base64,{s}) format(\"opentype\")", .{b64});
+}
+
+/// Build the `@font-face` block for a list of fonts. Caller owns the slice.
+///
+/// This is the FALLBACK shape, for a host with no `add_font` hook: a rule needs
+/// a stylesheet, and under a strict Content Security Policy there is nowhere to
+/// put one. `add_font` exists because of that, and this stays for hosts that
+/// predate it.
 pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -568,16 +617,11 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
         },
     };
 
-    // Inject a <style> with interactive rules if any were accumulated.
-    //
-    // Appended BEFORE the rules go in, and not after: a style element that is not
-    // in the document has no sheet, and `addRule` has nothing to add to. The
-    // fallback path does not care either way, so the order costs it nothing.
-    if (rules.items.len > 0) {
-        const style_node = ops.createElement("style");
-        ops.appendChild(ops.body, style_node);
-        ops.addRule(style_node, rules.items);
-    }
+    // The interactive rules, if any were accumulated.
+    // No element is created here any more. A `<style>` element is refused by a
+    // strict policy the moment it enters the document, even empty, so the rules
+    // go to a sheet that has no element at all. See `DomOps.add_rule`.
+    if (rules.items.len > 0) ops.addRule(rules.items);
 }
 
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
@@ -752,9 +796,14 @@ pub const Recorder = struct {
         self.rec("setStyle({d},{s})", .{ node, decl });
     }
 
-    fn addRule(ctx: *anyopaque, style_node: u32, rule: []const u8) void {
+    fn addRule(ctx: *anyopaque, css: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        self.rec("addRule({d},{s})", .{ style_node, rule });
+        self.rec("addRule({s})", .{css});
+    }
+
+    fn addFont(ctx: *anyopaque, family: []const u8, src: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("addFont({s},{s})", .{ family, src });
     }
 
     fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
@@ -789,6 +838,7 @@ pub const Recorder = struct {
             .read_host = readHost,
             .set_style = setStyle,
             .add_rule = addRule,
+            .add_font = addFont,
             .fill_random = fillRandom,
             .write_location = writeLocation,
             .read_scroll_offset = readScrollOffset,
@@ -881,7 +931,7 @@ test "dom_calls: stroke rrect records a border:...solid rgba style" {
     try std.testing.expect(contains(rec.log.items, "background:transparent"));
 }
 
-test "dom_calls: interactive fill rrect records class=pb0 and a style element with hover rule" {
+test "dom_calls: an interactive rrect gets its hover rule with no style element anywhere" {
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
@@ -898,7 +948,10 @@ test "dom_calls: interactive fill rrect records class=pb0 and a style element wi
     // The div must carry class="pb0" via setAttribute.
     try std.testing.expect(contains(rec.log.items, "setAttribute(") and contains(rec.log.items, "class,pb0"));
     // A style element must be created and its textContent must contain the hover rule.
-    try std.testing.expect(contains(rec.log.items, "createElement(style)"));
+    // No style element at all. A strict policy refuses one the moment it enters
+    // the document, even while it is still empty, so the rule goes to a sheet
+    // that has no element for a policy to refuse.
+    try std.testing.expect(!contains(rec.log.items, "createElement(style)"));
     try std.testing.expect(contains(rec.log.items, ".pb0:hover{background:"));
 }
 

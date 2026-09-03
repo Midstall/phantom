@@ -109,7 +109,8 @@ fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
 // that on the JS side also keeps it to ONE crossing per node, the same as the
 // attribute it replaces, instead of one per property.
 extern "phantom" fn __phantom_set_style(node: u32, ptr: [*]const u8, len: usize) void;
-extern "phantom" fn __phantom_add_rule(node: u32, ptr: [*]const u8, len: usize) void;
+extern "phantom" fn __phantom_add_rule(ptr: [*]const u8, len: usize) void;
+extern "phantom" fn __phantom_add_font(fam_ptr: [*]const u8, fam_len: usize, src_ptr: [*]const u8, src_len: usize) void;
 
 fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
     _ = ctx;
@@ -117,10 +118,16 @@ fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
     __phantom_set_style(node, decl.ptr, decl.len);
 }
 
-fn addRule(ctx: *anyopaque, node: u32, rule: []const u8) void {
+fn addRule(ctx: *anyopaque, css: []const u8) void {
     _ = ctx;
-    if (rule.len == 0) return;
-    __phantom_add_rule(node, rule.ptr, rule.len);
+    if (css.len == 0) return;
+    __phantom_add_rule(css.ptr, css.len);
+}
+
+fn addFont(ctx: *anyopaque, family: []const u8, src: []const u8) void {
+    _ = ctx;
+    if (family.len == 0 or src.len == 0) return;
+    __phantom_add_font(family.ptr, family.len, src.ptr, src.len);
 }
 fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
@@ -377,6 +384,7 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         .set_text_content = setTextContent,
         .set_style = setStyle,
         .add_rule = addRule,
+        .add_font = addFont,
         .append_child = appendChild,
         .clear_children = clearChildren,
         .body = body_handle,

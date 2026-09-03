@@ -648,14 +648,28 @@ pub fn init(
         }
         const fonts = try phantom.backend.dom.collectFonts(gpa, font_canvas.list);
         defer gpa.free(fonts);
-        if (fonts.len > 0) {
-            const css = try phantom.backend.dom_calls.fontFaceCss(gpa, fonts);
-            defer gpa.free(css);
-            const style_node = ops.createElement("style");
-            // In the document first: a detached style element has no sheet for
-            // `addRule` to reach. See `DomOps.add_rule`.
-            ops.appendChild(ops.head, style_node);
-            ops.addRule(style_node, css);
+        // Each font registered on its own, through `document.fonts` where the
+        // host offers it, and through an `@font-face` rule where it does not.
+        //
+        // No stylesheet is involved on the first path, and that is what makes it
+        // work: a `<style>` element is refused by a strict policy the moment it
+        // enters the document, even while it is still empty, so a font declared
+        // in one never reaches the browser at all. That failure is invisible
+        // except as slightly wrong letterforms, and it is not cosmetic: layout
+        // was measured against this font, the browser substitutes another, and
+        // then the glyphs on screen and the rectangles taps are tested against
+        // are describing two different pages.
+        for (fonts) |font_ptr| {
+            var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
+            const family = phantom.backend.dom_calls.fontFamily(&fam, font_ptr);
+            const src = try phantom.backend.dom_calls.fontSrc(gpa, font_ptr);
+            defer gpa.free(src);
+            // Sized for the fallback rule only. A `data:` source is far longer
+            // than this, and a host that needs the fallback AND embeds its fonts
+            // gets no face rather than a truncated one, which is the safer of
+            // the two: a truncated rule can be a VALID rule for the wrong font.
+            var rule_buf: [512]u8 = undefined;
+            ops.addFont(&rule_buf, family, src);
         }
     }
 
