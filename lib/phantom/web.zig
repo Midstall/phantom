@@ -1,6 +1,11 @@
 const std = @import("std");
 const phantom = @import("../phantom.zig");
 
+/// How many distinct fonts one page can register. A theme brings three and an
+/// application adds a few; a tree with more than this has a mistake in it rather
+/// than a need.
+pub const max_fonts = 16;
+
 /// Heap-allocated, page-lifetime web app. JS holds the pointer returned by init
 /// (as a usize) and passes it back to every dispatch entry. No module-level globals.
 pub const WebApp = struct {
@@ -18,6 +23,11 @@ pub const WebApp = struct {
     focus: phantom.FocusManager = .{},
     /// Sockets that are really `fetch`. See `web_net.zig`.
     net: phantom.web_net.Net,
+    /// The fonts already registered with the browser, so each is registered
+    /// once. Page-lifetime, because a face registered on one frame has to still
+    /// count as registered on the next.
+    fonts_seen: [max_fonts]*const phantom.text.Font = undefined,
+    fonts_seen_len: usize = 0,
     /// Scroll offsets carried across a rebuild. Lives for the whole page, not
     /// per render: `render` reads last frame's regions out of it before it
     /// clears the DOM, then repopulates it with this frame's regions.
@@ -53,6 +63,62 @@ pub const WebApp = struct {
         if (self.owner.dirty.items.len > 0) self.render();
     }
 
+    /// Register every font this frame draws with that has not been registered
+    /// before, and do it BEFORE the frame reaches the DOM.
+    ///
+    /// Called on every render rather than once at startup, and that is the fix
+    /// for a real bug rather than caution. Registering only what the FIRST frame
+    /// used meant a font that appears later never reached the browser at all: a
+    /// bold face on a screen the application had not opened yet was simply
+    /// absent, and the text drew in a fallback. That is not cosmetic. Layout was
+    /// measured against the real font, so the glyphs on screen and the rectangles
+    /// taps are tested against would describe two different pages.
+    ///
+    /// Registering is idempotent from here on, so the cost of a settled tree is
+    /// one walk of the display list and no calls at all.
+    fn registerFonts(self: *WebApp, list: phantom.display_list.DisplayList) void {
+        const fonts = phantom.backend.dom.collectFonts(self.gpa, list) catch {
+            // The frame still draws. What is lost is a face for a font this
+            // frame introduced, which shows as one run in a fallback until a
+            // later frame succeeds.
+            self.sink.report(.oom, "the fonts of this frame could not be collected");
+            return;
+        };
+        defer self.gpa.free(fonts);
+
+        for (fonts) |font_ptr| {
+            var already = false;
+            for (self.fonts_seen[0..self.fonts_seen_len]) |seen| {
+                if (seen == font_ptr) already = true;
+            }
+            if (already) continue;
+            if (self.fonts_seen_len == self.fonts_seen.len) {
+                // Bounded on purpose. A tree with more distinct fonts than this
+                // is a mistake worth reporting rather than a case worth growing
+                // for, and the frame still draws in a fallback face.
+                self.sink.report(.region_overflow, "more distinct fonts than this page can register");
+                return;
+            }
+
+            var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
+            const family = phantom.backend.dom_calls.fontFamily(&fam, font_ptr);
+            const src = phantom.backend.dom_calls.fontSrc(self.gpa, font_ptr) catch {
+                self.sink.report(.oom, "a font source could not be built");
+                return;
+            };
+            defer self.gpa.free(src);
+            // Sized for the fallback rule only. A `data:` source is far longer
+            // than this, and a host that needs the fallback AND embeds its fonts
+            // gets no face rather than a truncated one, which is the safer of the
+            // two: a truncated rule can be a VALID rule for the wrong font.
+            var rule_buf: [512]u8 = undefined;
+            self.ops.addFont(&rule_buf, family, src);
+
+            self.fonts_seen[self.fonts_seen_len] = font_ptr;
+            self.fonts_seen_len += 1;
+        }
+    }
+
     pub fn render(self: *WebApp) void {
         // One BuildContext per render for flushDirty + layout + paint.
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = self.owner };
@@ -78,6 +144,10 @@ pub const WebApp = struct {
         ro.paint(&canvas, phantom.PhysicalOffset.zero) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
+        // Before the frame reaches the DOM, so a face exists by the time any
+        // text asks for it. See `registerFonts`.
+        self.registerFonts(canvas.list);
+
         // Consumed once per navigation: a route change sets this before the
         // render it causes, and this render is the only one that reads it.
         const reset_scroll = self.owner.route_changed;
@@ -629,49 +699,6 @@ pub fn init(
         break :eb try errbox.widget().mount(&bctx, null);
     };
     app.root = root_element;
-
-    // Inject @font-face for all fonts used by the initial render ONCE into <head>.
-    // Do one layout+paint into a throwaway canvas to discover which fonts the tree uses,
-    // build the CSS block, and append a <style> element before the real first render.
-    {
-        const physical = view.metrics.size.toPhysical(view.metrics.text_scale);
-        var font_canvas = phantom.Canvas.init(gpa);
-        font_canvas.sink = sink;
-        defer font_canvas.deinit();
-        if (root_element.renderObject()) |ro| {
-            _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, view.metrics.text_scale));
-            // A failure here loses the font list, so the first frame draws in a
-            // fallback face. Recording it is the only way that is visible.
-            ro.paint(&font_canvas, phantom.PhysicalOffset.zero) catch |err| {
-                sink.report(.render_failed, @errorName(err));
-            };
-        }
-        const fonts = try phantom.backend.dom.collectFonts(gpa, font_canvas.list);
-        defer gpa.free(fonts);
-        // Each font registered on its own, through `document.fonts` where the
-        // host offers it, and through an `@font-face` rule where it does not.
-        //
-        // No stylesheet is involved on the first path, and that is what makes it
-        // work: a `<style>` element is refused by a strict policy the moment it
-        // enters the document, even while it is still empty, so a font declared
-        // in one never reaches the browser at all. That failure is invisible
-        // except as slightly wrong letterforms, and it is not cosmetic: layout
-        // was measured against this font, the browser substitutes another, and
-        // then the glyphs on screen and the rectangles taps are tested against
-        // are describing two different pages.
-        for (fonts) |font_ptr| {
-            var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
-            const family = phantom.backend.dom_calls.fontFamily(&fam, font_ptr);
-            const src = try phantom.backend.dom_calls.fontSrc(gpa, font_ptr);
-            defer gpa.free(src);
-            // Sized for the fallback rule only. A `data:` source is far longer
-            // than this, and a host that needs the fallback AND embeds its fonts
-            // gets no face rather than a truncated one, which is the safer of
-            // the two: a truncated rule can be a VALID rule for the wrong font.
-            var rule_buf: [512]u8 = undefined;
-            ops.addFont(&rule_buf, family, src);
-        }
-    }
 
     // Reset the default body margin and paint the branded background to the
     // window edges, ONCE. Applied to the body ELEMENT rather than through a
@@ -1575,4 +1602,71 @@ test "init resets the page margin, or the themed background sits inside the brow
             std.mem.indexOf(u8, line, "margin:0") != null) reset = true;
     }
     try std.testing.expect(reset);
+}
+
+/// A display list holding one text run in `font`, which is all `registerFonts`
+/// reads. Built by hand because the case under test is a font appearing on a
+/// LATER frame, and the whole bug was that only the first frame was ever looked
+/// at: a tree that draws the same thing every frame cannot express it.
+fn oneTextRun(gpa: std.mem.Allocator, font: *phantom.text.Font, glyphs: []const phantom.display_list.PositionedGlyph) !phantom.display_list.DisplayList {
+    var list = phantom.display_list.DisplayList{};
+    try list.append(gpa, .{ .text = .{
+        .glyphs = glyphs,
+        .text = "hi",
+        .font = font,
+        .size = 16,
+        .color = phantom.Color.rgb(1, 1, 1),
+        .origin = phantom.PhysicalOffset.zero,
+    } });
+    return list;
+}
+
+test "a font that first appears on a later frame is still registered" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The first frame drew with the body font, and that one is registered.
+    try std.testing.expectEqual(@as(usize, 1), app.fonts_seen_len);
+
+    // A bold run now appears, on a screen the application had not opened when it
+    // started. Registering only what the FIRST frame used, which is what this
+    // did, meant the browser never heard about this font at all: the run drew in
+    // a fallback, measured against one font and painted with another.
+    const glyphs = [_]phantom.display_list.PositionedGlyph{.{ .cp = 'h', .x = 0, .y = 0 }};
+    var later = try oneTextRun(gpa, &app.owner.default_body_bold_font.?, &glyphs);
+    defer later.deinit(gpa);
+    app.registerFonts(later);
+
+    try std.testing.expectEqual(@as(usize, 2), app.fonts_seen_len);
+    var registered: usize = 0;
+    for (rec.log.items) |line| {
+        if (std.mem.startsWith(u8, line, "addFont(")) registered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), registered);
+}
+
+test "a font already registered is not registered again, however many frames draw it" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // A settled tree costs one walk of the display list per frame and no calls
+    // at all, which is what makes registering on every frame affordable.
+    const glyphs = [_]phantom.display_list.PositionedGlyph{.{ .cp = 'h', .x = 0, .y = 0 }};
+    var same = try oneTextRun(gpa, app.owner.default_theme.?.body_font, &glyphs);
+    defer same.deinit(gpa);
+    app.registerFonts(same);
+    app.registerFonts(same);
+    app.render();
+
+    var registered: usize = 0;
+    for (rec.log.items) |line| {
+        if (std.mem.startsWith(u8, line, "addFont(")) registered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), registered);
 }
