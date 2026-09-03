@@ -243,11 +243,12 @@ fn applyLocation(h: phantom.RouterHandle, path: []const u8) void {
     }
 }
 
-fn openUrlThunk(ctx: *anyopaque, url: []const u8) void {
+fn openUrlThunk(ctx: *anyopaque, url: []const u8, mode: phantom.OpenMode) bool {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
     // `init` installs this thunk only when `ops.open_url` is set, so the
-    // hook is never null here.
-    app.ops.open_url.?(app.ops.ctx, url);
+    // hook is never null here. Its answer is passed through rather than
+    // replaced with `true`: a browser that refused the call said so.
+    return app.ops.open_url.?(app.ops.ctx, url, mode);
 }
 
 fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
@@ -658,16 +659,29 @@ pub fn init(
         }
     }
 
-    // Reset the default body margin and paint the branded background to the window
-    // edges, ONCE, into <head> (mirrors the string backend's base style). Injected at
-    // <head> so it survives the per-render clearChildren(body) sweep.
+    // Reset the default body margin and paint the branded background to the
+    // window edges, ONCE. Applied to the body ELEMENT rather than through a
+    // stylesheet, and that choice is load bearing twice over.
+    //
+    // A browser gives `body` an 8px margin of its own, and the container this
+    // backend draws into is sized to the WHOLE viewport, so any margin at all
+    // pushes the whole page down and right: two strips of unthemed white at the
+    // top and left, and the same amount lost off the bottom and right, unseen.
+    //
+    // It goes through the element's own style because that is the path this
+    // backend already proves on every frame, for every node it positions. A rule
+    // in a sheet has one more thing that has to be true, a sheet to put it in,
+    // and this is the one declaration whose failure is not cosmetic: it takes
+    // the whole page off its origin. The rules that DO need a sheet are the ones
+    // that cannot be written any other way, hover and `@font-face`.
+    //
+    // Setting it on `body` also reaches `html`, because a browser propagates the
+    // body's background to the canvas when the root has none of its own.
     {
         const bg = phantom.ColorScheme.tokyoNight().bg;
-        const css = try std.fmt.allocPrint(gpa, "html,body{{margin:0;background:rgb({d},{d},{d})}}", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
-        defer gpa.free(css);
-        const style_node = ops.createElement("style");
-        ops.appendChild(ops.head, style_node);
-        ops.addRule(style_node, css);
+        const decl = try std.fmt.allocPrint(gpa, "margin:0;background:rgb({d},{d},{d})", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
+        defer gpa.free(decl);
+        ops.setStyle(ops.body, decl);
     }
 
     app.render();
@@ -965,7 +979,7 @@ test "web.init leaves the platform's open_url unset when the host has no open_ur
     const app = try init(gpa, rec.ops(), phantom.Root.plain(linkRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
     defer destroyWebApp(gpa, app);
 
-    try std.testing.expect(!app.owner.platform.openUrl("https://example.com"));
+    try std.testing.expect(!app.owner.platform.openUrl("https://example.com", .new_tab));
 
     const ro = app.root.renderObject().?;
     app.dispatchTap(ro.origin.x + ro.size.width * 0.5, ro.origin.y + ro.size.height * 0.5);
@@ -1524,4 +1538,27 @@ test "a page drawn with the default theme embeds no font, so a strict font-src c
     }
     try std.testing.expect(!embedded);
     try std.testing.expect(referenced);
+}
+
+test "init resets the page margin, or the themed background sits inside the browser's own 8px" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The container is sized to the FULL viewport, so any body margin pushes it
+    // down and right: the page shows two strips of unthemed white at the top and
+    // left, and loses the same amount off the bottom and right, unseen.
+    //
+    // Asserted on the BODY specifically, and through setStyle rather than a
+    // sheet rule, because that is the path this backend proves on every frame.
+    // A sheet needs a sheet to exist; this needs nothing that positioning a node
+    // does not already need.
+    var reset = false;
+    for (rec.log.items) |line| {
+        if (std.mem.startsWith(u8, line, "setStyle(1,") and
+            std.mem.indexOf(u8, line, "margin:0") != null) reset = true;
+    }
+    try std.testing.expect(reset);
 }

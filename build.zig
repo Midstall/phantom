@@ -778,7 +778,13 @@ fn buildBootJs(b: *std.Build, runtime_import: []const u8, wasm_name: []const u8)
         \\// are `rgba(1,2,3,0.5)`, which carries commas and never a semicolon.
         \\const setStyle = (node, ptr, len) => {{
         \\  const el = host.value(node);
-        \\  if (!el) return;
+        \\  // Never silently: a node that cannot be styled is a node drawn at the
+        \\  // wrong place, or not drawn at all, and a page of those with nothing in
+        \\  // the console is the hardest kind of wrong to chase.
+        \\  if (!el) {{
+        \\    console.warn("phantom: no element for handle " + node + ", so its style was dropped");
+        \\    return;
+        \\  }}
         \\  for (const part of str(ptr, len).split(";")) {{
         \\    const i = part.indexOf(":");
         \\    if (i <= 0) continue;
@@ -794,7 +800,17 @@ fn buildBootJs(b: *std.Build, runtime_import: []const u8, wasm_name: []const u8)
         \\const addRule = (node, ptr, len) => {{
         \\  const el = host.value(node);
         \\  const sheet = el && el.sheet;
-        \\  if (!sheet) return;
+        \\  // Said out loud rather than returned from quietly. A missing sheet
+        \\  // means every rule for it is dropped, and the page then renders
+        \\  // ALMOST right, which is the hardest kind of wrong to find: no hover
+        \\  // states and fallback fonts, with nothing anywhere saying why.
+        \\  if (!sheet) {{
+        \\    console.warn(
+        \\      "phantom: a style element has no sheet, so its rules were dropped. " +
+        \\      "It has to be in the document before any rule is added to it.",
+        \\    );
+        \\    return;
+        \\  }}
         \\  for (const rule of splitRules(str(ptr, len))) {{
         \\    try {{
         \\      sheet.insertRule(rule, sheet.cssRules.length);

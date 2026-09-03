@@ -265,10 +265,30 @@ fn httpSend(ctx: *anyopaque, gpa: std.mem.Allocator, req: phantom.web_net.Reques
     ) catch null;
 }
 
-fn openUrl(ctx: *anyopaque, url: []const u8) void {
+/// Open `url`, and report whether the browser actually did it.
+///
+/// A new tab can be refused: a browser blocks `window.open` when it decides the
+/// call is a popup, which is any call not tied to a fresh user gesture, and an
+/// application that awaited a request before calling has already spent its one.
+/// It says so by handing back null, and that has to reach the caller so a page
+/// can offer the link instead of appearing to ignore the tap.
+///
+/// A same-tab navigation cannot be refused that way, because it is a navigation
+/// and not a window. It is what a sign in hop wants: the person comes back to
+/// the callback in the tab they left from.
+fn openUrl(ctx: *anyopaque, url: []const u8, mode: phantom.OpenMode) bool {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
-    win.open(url, "_blank");
+    switch (mode) {
+        .same_tab => {
+            win.get_location().assign(url);
+            // The page is leaving. Nothing after this runs long enough to
+            // report anything else.
+            return true;
+        },
+        // Handle zero is the null the runtime maps a refused window to.
+        .new_tab => return win.open(url, "_blank").handle != 0,
+    }
 }
 
 fn readLocation(ctx: *anyopaque, buf: []u8) ?[]const u8 {

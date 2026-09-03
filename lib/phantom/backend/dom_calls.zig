@@ -34,7 +34,10 @@ pub const DomOps = struct {
     body: u32,
     head: u32,
     /// Opens a URL in a new tab. Null on a host that has no browser.
-    open_url: ?*const fn (ctx: *anyopaque, url: []const u8) void = null,
+    /// Opens `url` in `mode`, and reports whether it WAS opened. A browser hands
+    /// back nothing when it refuses a popup, and that has to reach the caller:
+    /// see `platform.OpenMode`.
+    open_url: ?*const fn (ctx: *anyopaque, url: []const u8, mode: platform.OpenMode) bool = null,
     /// Writes the current route into `buf` and returns the written part, or
     /// null when the real route is longer than `buf` can hold. A truncated
     /// route is a different, shorter one than the browser actually shows, so

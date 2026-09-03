@@ -43,6 +43,10 @@ interface Location {
   // the page, and a request carries a bare host name with its port kept apart,
   // so `hostname` is the one that can match and `host` is not.
   readonly attribute DOMString hostname;
+  // Navigates this tab. What a sign in hop needs: a person leaves for the
+  // forge and comes back to the callback in the tab they started in, and a
+  // popup blocker cannot refuse it the way it can refuse a new window.
+  undefined assign(DOMString url);
   // The query string, the leading "?" included, and empty when there is none.
   // A redirect that comes back carrying a state or an error puts it here, and
   // it is where a deep link keeps what is not part of the route.
@@ -62,7 +66,11 @@ interface Window {
   readonly attribute Location location;
   readonly attribute History history;
   readonly attribute Crypto crypto;
-  undefined open(DOMString url, DOMString target);
+  // Returns the new window, or null when the browser refused to open one,
+  // which is what a popup blocker does. The caller has to see that: a page
+  // that announces a tab which is not there is worse than one that says it
+  // could not open it.
+  Window open(DOMString url, DOMString target);
   // Reports a message to the console as an uncaught error. This is how a panic
   // in wasm says anything at all: the trap on its own reaches a developer as
   // "RuntimeError: unreachable" with nothing in it.
